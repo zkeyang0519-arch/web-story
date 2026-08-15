@@ -1,6 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useRef, useState } from "react";
+import { useRouter } from "next/navigation";
 
 type ReferenceItem = {
   id: string;
@@ -26,6 +27,8 @@ type Project = {
   id: string;
   title: string;
   status: string;
+  draftStep: "references" | "requirements" | "settings" | "locked";
+  draftVersion: number;
   progress: number;
   runMode: "demo" | "production";
   createdAt: string;
@@ -35,7 +38,15 @@ type Project = {
     platform: string;
     audience: string;
     goal: string;
-    references: Array<{ name: string; kind: string }>;
+    topicMode?: "manual" | "ai";
+    topic?: string;
+    style?: string;
+    company?: string;
+    mustInclude?: string;
+    mustAvoid?: string;
+    cta?: string;
+    rightsConfirmed?: boolean;
+    references: ReferenceItem[];
   };
   result?: ProjectResult | null;
 };
@@ -46,6 +57,8 @@ type SystemInfo = {
   model: string;
   storage: boolean;
 };
+
+type StudioView = "references" | "brief" | "spec" | "progress" | "result";
 
 const stages = [
   { key: "ingesting", label: "处理参考视频", short: "参考" },
@@ -100,8 +113,8 @@ function statusCopy(status: string) {
   return copy[status] ?? copy.ingesting;
 }
 
-export function Studio() {
-  const [screen, setScreen] = useState<"create" | "progress" | "result">("create");
+export function Studio({ view = "references", projectId }: { view?: StudioView; projectId?: string }) {
+  const router = useRouter();
   const [references, setReferences] = useState<ReferenceItem[]>([]);
   const [urlDraft, setUrlDraft] = useState("");
   const [topicMode, setTopicMode] = useState<"manual" | "ai">("ai");
@@ -127,7 +140,9 @@ export function Studio() {
   const [elapsedTick, setElapsedTick] = useState(0);
   const fileInput = useRef<HTMLInputElement>(null);
   const videoRef = useRef<HTMLVideoElement>(null);
-  const activeProjectId = project?.id;
+  const draftCreateStarted = useRef(false);
+  const draftVersionRef = useRef(1);
+  const activeProjectId = project?.id ?? projectId;
 
   useEffect(() => {
     fetch("/api/system")
@@ -137,7 +152,62 @@ export function Studio() {
   }, []);
 
   useEffect(() => {
-    if (screen !== "progress" || !activeProjectId) return;
+    if (view !== "references" || projectId || draftCreateStarted.current) return;
+    draftCreateStarted.current = true;
+    const requestKey = uid("draft");
+    fetch("/api/projects", {
+      method: "POST",
+      headers: { "content-type": "application/json", "Idempotency-Key": requestKey },
+      body: JSON.stringify({ action: "draft", requestKey }),
+    })
+      .then(async (response) => {
+        const data = await response.json() as { project?: Project; error?: string };
+        if (!response.ok || !data.project) throw new Error(data.error ?? "草稿创建失败");
+        setProject(data.project);
+        draftVersionRef.current = data.project.draftVersion;
+        router.replace(`/projects/${data.project.id}/references`);
+      })
+      .catch((error) => setMessage(error instanceof Error ? error.message : "草稿创建失败，请刷新重试。"));
+  }, [projectId, router, view]);
+
+  useEffect(() => {
+    if (!activeProjectId) return;
+    fetch(`/api/projects/${activeProjectId}`, { cache: "no-store" })
+      .then((response) => response.ok ? response.json() : null)
+      .then((data) => {
+        const loaded = (data as { project?: Project } | null)?.project;
+        if (!loaded) return;
+        setProject(loaded);
+        draftVersionRef.current = loaded.draftVersion;
+        const input = loaded.input;
+        if (input.references) setReferences(input.references.map((item) => ({ ...item, file: undefined })));
+        if (input.topicMode) setTopicMode(input.topicMode);
+        if (typeof input.topic === "string") setTopic(input.topic);
+        if (input.goal) setGoal(input.goal);
+        if (input.audience) setAudience(input.audience);
+        if (input.platform) setPlatform(input.platform);
+        if (input.duration) setDuration(input.duration);
+        if (input.style) setStyle(input.style);
+        if (typeof input.company === "string") setCompany(input.company);
+        if (typeof input.mustInclude === "string") setMustInclude(input.mustInclude);
+        if (typeof input.mustAvoid === "string") setMustAvoid(input.mustAvoid);
+        if (typeof input.cta === "string") setCta(input.cta);
+        if (typeof input.rightsConfirmed === "boolean") setRightsConfirmed(input.rightsConfirmed);
+        if (["references", "brief", "spec"].includes(view) && loaded.status !== "draft") {
+          router.replace(loaded.status === "completed" ? `/projects/${loaded.id}/delivery` : `/projects/${loaded.id}/progress`);
+          return;
+        }
+        if (view === "brief" && loaded.draftStep === "references") router.replace(`/projects/${loaded.id}/references`);
+        if (view === "spec" && loaded.draftStep === "references") router.replace(`/projects/${loaded.id}/references`);
+        if (view === "spec" && loaded.draftStep === "requirements") router.replace(`/projects/${loaded.id}/requirements`);
+        if (view === "progress" && loaded.status === "completed") router.replace(`/projects/${loaded.id}/delivery`);
+        if (view === "result" && loaded.status !== "completed") router.replace(`/projects/${loaded.id}/progress`);
+      })
+      .catch(() => undefined);
+  }, [activeProjectId, router, view]);
+
+  useEffect(() => {
+    if (view !== "progress" || !activeProjectId) return;
     const timer = window.setInterval(async () => {
       setElapsedTick((value) => value + 1);
       try {
@@ -145,13 +215,14 @@ export function Studio() {
         if (!response.ok) return;
         const data = (await response.json()) as { project: Project };
         setProject(data.project);
-        if (data.project.status === "completed") setScreen("result");
+        draftVersionRef.current = data.project.draftVersion;
+        if (data.project.status === "completed") router.replace(`/projects/${data.project.id}/delivery`);
       } catch {
         // The persisted project stays visible while a transient poll fails.
       }
     }, 1500);
     return () => window.clearInterval(timer);
-  }, [activeProjectId, screen]);
+  }, [activeProjectId, router, view]);
 
   const addFiles = useCallback((files: FileList | File[]) => {
     setMessage("");
@@ -209,10 +280,30 @@ export function Studio() {
     } : item));
   }
 
+  function serializableReferences(items = references) {
+    return items.map((item) => ({ id: item.id, kind: item.kind, name: item.name, url: item.url, size: item.size, priority: item.priority, emphasis: item.emphasis, uploadId: item.uploadId }));
+  }
+
+  async function patchDraft(step: "references" | "requirements" | "settings", data: Record<string, unknown>, advance = false) {
+    if (!activeProjectId) throw new Error("草稿尚未准备好，请稍后重试。");
+    const response = await fetch(`/api/projects/${activeProjectId}`, {
+      method: "PATCH",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ step, data, advance, draftVersion: draftVersionRef.current }),
+    });
+    const result = await response.json() as { project?: Project; error?: string };
+    if (!response.ok || !result.project) throw new Error(result.error ?? "草稿保存失败");
+    setProject(result.project);
+    draftVersionRef.current = result.project.draftVersion;
+    return result.project;
+  }
+
   async function uploadReference(item: ReferenceItem) {
-    if (!item.file) return { name: item.name, kind: item.kind, url: item.url, priority: item.priority, emphasis: item.emphasis };
+    if (!item.file) return { name: item.name, kind: item.kind, url: item.url, uploadId: item.uploadId, priority: item.priority, emphasis: item.emphasis };
     const body = new FormData();
     body.append("file", item.file);
+    if (!activeProjectId) throw new Error("草稿尚未准备好，请稍后重试。");
+    body.append("projectId", activeProjectId);
     const response = await fetch("/api/uploads", { method: "POST", body });
     if (!response.ok) {
       const detail = await response.json().catch(() => null) as { error?: string } | null;
@@ -220,6 +311,46 @@ export function Studio() {
     }
     const data = await response.json() as { upload: { id: string } };
     return { name: item.name, kind: item.kind, uploadId: data.upload.id, priority: item.priority, emphasis: item.emphasis };
+  }
+
+  async function continueFromReferences() {
+    setMessage("");
+    if (!references.length) return setMessage("请先添加至少一个参考视频。 ");
+    setSubmitting(true);
+    try {
+      const normalized: ReferenceItem[] = references.map((item) => ({ ...item }));
+      for (let index = 0; index < references.length; index += 1) {
+        const item = normalized[index];
+        setSubmitLabel(item.file ? `上传参考 ${index + 1}/${references.length}` : `检查参考 ${index + 1}/${references.length}`);
+        const uploaded = await uploadReference(item);
+        normalized[index] = { id: item.id, kind: item.kind, name: item.name, url: item.url, size: item.size, priority: item.priority, emphasis: item.emphasis, uploadId: uploaded.uploadId };
+        setReferences([...normalized]);
+        if (item.file) await patchDraft("references", { references: serializableReferences(normalized) });
+      }
+      await patchDraft("references", { references: serializableReferences(normalized) }, true);
+      router.push(`/projects/${activeProjectId}/requirements`);
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "参考视频处理失败，请重试。 ");
+    } finally {
+      setSubmitting(false);
+      setSubmitLabel("下一步：创作要求");
+    }
+  }
+
+  async function continueFromBrief() {
+    setMessage("");
+    if (!references.length) return router.push(activeProjectId ? `/projects/${activeProjectId}/references` : "/");
+    if (!audience.trim()) return setMessage("请填写目标观众。 ");
+    if (topicMode === "manual" && !topic.trim()) return setMessage("请填写视频主题，或改为由 AI 自动提出。 ");
+    setSubmitting(true);
+    try {
+      await patchDraft("requirements", { topicMode, topic: topic.trim(), goal, audience: audience.trim(), company: company.trim(), mustInclude: mustInclude.trim(), mustAvoid: mustAvoid.trim(), cta: cta.trim() }, true);
+      router.push(`/projects/${activeProjectId}/settings`);
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "创作要求保存失败，请重试。 ");
+    } finally {
+      setSubmitting(false);
+    }
   }
 
   async function startProduction() {
@@ -231,40 +362,20 @@ export function Studio() {
 
     setSubmitting(true);
     try {
-      const uploaded = [];
-      for (let index = 0; index < references.length; index += 1) {
-        setSubmitLabel(`上传参考 ${index + 1}/${references.length}`);
-        uploaded.push(await uploadReference(references[index]));
-      }
       setSubmitLabel("创建制作任务");
       const requestKey = uid("req");
-      const payload = {
-        requestKey,
-        topicMode,
-        topic: topic.trim(),
-        goal,
-        audience: audience.trim(),
-        platform,
-        duration,
-        ratio: "9:16",
-        style,
-        company: company.trim(),
-        mustInclude: mustInclude.trim(),
-        mustAvoid: mustAvoid.trim(),
-        cta: cta.trim(),
-        rightsConfirmed,
-        references: uploaded,
-      };
-      const response = await fetch("/api/projects", {
+      await patchDraft("settings", { platform, duration, ratio: "9:16", style, rightsConfirmed }, true);
+      if (!activeProjectId) throw new Error("草稿尚未准备好，请稍后重试。");
+      const response = await fetch(`/api/projects/${activeProjectId}/generate`, {
         method: "POST",
         headers: { "content-type": "application/json", "Idempotency-Key": requestKey },
-        body: JSON.stringify(payload),
+        body: JSON.stringify({ requestKey, draftVersion: draftVersionRef.current }),
       });
       const data = await response.json() as { error?: string; project: Project };
       if (!response.ok) throw new Error(data.error ?? "任务创建失败");
       setProject(data.project);
       window.localStorage.setItem("jingliu:last-project", data.project.id);
-      setScreen("progress");
+      router.push(`/projects/${data.project.id}/progress`);
       window.scrollTo({ top: 0, behavior: "smooth" });
     } catch (error) {
       setMessage(error instanceof Error ? error.message : "任务创建失败，请重试。 ");
@@ -276,9 +387,8 @@ export function Studio() {
 
   function resetProduction() {
     setProject(null);
-    setScreen("create");
     setIsPlaying(true);
-    window.scrollTo({ top: 0, behavior: "smooth" });
+    router.push("/");
   }
 
   function toggleVideo() {
@@ -318,17 +428,35 @@ export function Studio() {
   const currentCopy = project ? statusCopy(project.status) : statusCopy("ingesting");
   const shotTotal = duration === 15 ? 6 : duration === 30 ? 9 : 14;
   const shotsDone = project ? Math.min(shotTotal, Math.max(0, Math.round((project.progress - 42) / 58 * shotTotal))) : 0;
-  const canStart = references.length > 0 && audience.trim() && (topicMode === "ai" || topic.trim()) && rightsConfirmed;
+  const canBriefContinue = references.length > 0 && Boolean(audience.trim()) && (topicMode === "ai" || Boolean(topic.trim()));
+  const canStart = canBriefContinue && rightsConfirmed;
   const title = topicMode === "manual" && topic.trim() ? topic.trim() : "AI 将根据参考视频自动定题";
   const modelLabel = system.model || "Seedance 2.0 Standard";
+  const createStep = view === "references" ? 1 : view === "brief" ? 2 : 3;
+  const pageCopy = view === "references"
+    ? { eyebrow: "STEP 01 / REFERENCE", first: "先给我看，", second: "你喜欢什么。", lead: "添加参考视频并标记你喜欢的部分。完成后，再进入创作要求。" }
+    : view === "brief"
+      ? { eyebrow: "STEP 02 / CREATIVE BRIEF", first: "说清楚，", second: "这条视频要打动谁。", lead: "确定主题来源、内容目标和目标观众，然后再确认最终成片规格。" }
+      : { eyebrow: "STEP 03 / PRODUCTION SPEC", first: "最后确认，", second: "成片怎么交付。", lead: "确认平台、时长、画面风格与素材权利后，系统才会正式开始制作。" };
+  const nextAction = view === "references" ? continueFromReferences : view === "brief" ? continueFromBrief : startProduction;
+  const nextDisabled = view === "references" ? references.length === 0 : view === "brief" ? !canBriefContinue : !canStart;
+  const nextLabel = submitting ? submitLabel : view === "references" ? "下一步：创作要求" : view === "brief" ? "下一步：成片设置" : "开始制片";
 
-  if (screen === "progress" && project) {
+  if (projectId && ["references", "brief", "spec"].includes(view) && !project) {
+    return <ProjectLoading system={system} label="正在恢复制片草稿" />;
+  }
+
+  if ((view === "progress" || view === "result") && !project) {
+    return <ProjectLoading system={system} label={view === "progress" ? "正在载入制作任务" : "正在载入成片"} />;
+  }
+
+  if (view === "progress" && project) {
     return (
       <main className="studio-shell progress-shell">
         <Topbar system={system} compact />
         <section className="progress-head wrap">
           <div>
-            <button className="text-button" onClick={() => setScreen("create")}>← 返回制片单</button>
+            <button className="text-button" onClick={() => router.push("/")}>← 返回制片单</button>
             <p className="eyebrow">任务 {project.id.slice(0, 8).toUpperCase()}</p>
             <h1>正在制作视频</h1>
             <p>任务会在后台继续运行，你可以安全离开此页面。</p>
@@ -402,7 +530,7 @@ export function Studio() {
     );
   }
 
-  if (screen === "result" && project) {
+  if (view === "result" && project) {
     const hasVideo = Boolean(project.result?.videoUrl);
     return (
       <main className="studio-shell delivery-shell">
@@ -463,11 +591,19 @@ export function Studio() {
   return (
     <main className="studio-shell create-shell">
       <Topbar system={system} />
+      <nav className="wizard-bar wrap" aria-label="新建视频步骤">
+        {["参考素材", "创作要求", "成片设置"].map((label, index) => {
+          const step = index + 1;
+          const state = step < createStep ? "done" : step === createStep ? "active" : "pending";
+          return <div className={`wizard-step ${state}`} key={label}><span>{state === "done" ? "✓" : String(step).padStart(2, "0")}</span><strong>{label}</strong><i /></div>;
+        })}
+      </nav>
       <section className="hero wrap">
         <div className="hero-copy">
-          <p className="eyebrow">AI DIRECTOR&apos;S DESK / MVP 01</p>
-          <h1>把参考灵感，<br /><em>变成一条可交付成片。</em></h1>
-          <p className="hero-lead">添加参考视频与创作方向，其余步骤交给系统。解析、创意、镜头、质检和剪辑在后台一次完成。</p>
+          {view !== "references" && <button className="step-back" onClick={() => router.push(view === "brief" ? `/projects/${activeProjectId}/references` : `/projects/${activeProjectId}/requirements`)}>← 返回上一步</button>}
+          <p className="eyebrow">{pageCopy.eyebrow}</p>
+          <h1>{pageCopy.first}<br /><em>{pageCopy.second}</em></h1>
+          <p className="hero-lead">{pageCopy.lead}</p>
         </div>
         <div className="hero-filmstrip" aria-hidden="true">
           <div className="film-frame frame-a"><span>REFERENCE</span><i>01</i></div>
@@ -479,7 +615,7 @@ export function Studio() {
 
       <section className="workspace wrap">
         <div className="brief-column">
-          <section className="form-section">
+          {view === "references" && <section className="form-section step-form-section">
             <div className="section-heading"><span className="section-number">01</span><div><h2>参考内容</h2><p>添加 1～10 个视频，最多标记 3 个重点参考。</p></div><button className="example-button" onClick={loadDemoReferences}>载入示例</button></div>
             <div className={`upload-zone ${isDragging ? "dragging" : ""}`} onDragOver={(event) => { event.preventDefault(); setIsDragging(true); }} onDragLeave={() => setIsDragging(false)} onDrop={(event) => { event.preventDefault(); setIsDragging(false); addFiles(event.dataTransfer.files); }}>
               <input ref={fileInput} type="file" accept="video/mp4,video/quicktime,video/webm" multiple hidden onChange={(event) => event.target.files && addFiles(event.target.files)} />
@@ -496,34 +632,40 @@ export function Studio() {
                 <div className="reference-actions"><button className={item.priority ? "priority active" : "priority"} onClick={() => togglePriority(item.id)}>{item.priority ? "★ 重点" : "☆ 设为重点"}</button><button className="remove" aria-label={`移除 ${item.name}`} onClick={() => setReferences((items) => items.filter((entry) => entry.id !== item.id))}>×</button></div>
               </article>)}
             </div>}
-          </section>
+          </section>}
 
-          <section className="form-section">
+          {view === "brief" && <section className="form-section step-form-section">
             <div className="section-heading"><span className="section-number">02</span><div><h2>创作要求</h2><p>告诉系统要对谁说、为什么说。</p></div></div>
             <fieldset className="topic-modes"><legend>主题来源</legend><button className={topicMode === "manual" ? "active" : ""} onClick={() => setTopicMode("manual")}><span>我已有主题</span><small>直接按明确主题创作</small></button><button className={topicMode === "ai" ? "active" : ""} onClick={() => setTopicMode("ai")}><span>由 AI 自动定题</span><small>根据参考视频提出主题</small></button></fieldset>
             {topicMode === "manual" && <label className="field"><span>视频主题</span><input value={topic} onChange={(event) => setTopic(event.target.value)} placeholder="例如：下班后，也能把生活过得很充实" /></label>}
             {topicMode === "ai" && <div className="ai-topic-note"><span>AI</span><p>系统会比较所有参考的创意点，最终只保留一个最适合当前受众与目标的主题。</p></div>}
             <div className="field"><span>内容目标</span><div className="choice-grid">{goals.map((item) => <button className={goal === item ? "active" : ""} key={item} onClick={() => setGoal(item)}>{item}</button>)}</div></div>
             <label className="field"><span>目标观众</span><textarea value={audience} onChange={(event) => setAudience(event.target.value)} rows={2} placeholder="例如：20～30 岁、刚工作的城市年轻人" /></label>
-            <div className="two-fields"><div className="field"><span>发布平台</span><div className="segmented">{["抖音", "小红书"].map((item) => <button className={platform === item ? "active" : ""} key={item} onClick={() => setPlatform(item)}>{item}</button>)}</div></div><div className="field"><span>成片时长</span><div className="segmented">{[15, 30, 60].map((item) => <button className={duration === item ? "active" : ""} key={item} onClick={() => setDuration(item)}>{item}s</button>)}</div></div></div>
-          </section>
+          </section>}
 
-          <section className="form-section advanced-section">
-            <button className="advanced-toggle" onClick={() => setAdvanced((value) => !value)}><span><b>03</b><strong>高级要求</strong><small>客户、风格、必备内容与避雷项</small></span><i>{advanced ? "−" : "+"}</i></button>
-            {advanced && <div className="advanced-fields"><div className="field"><span>风格倾向</span><div className="choice-grid styles">{styles.map((item) => <button className={style === item ? "active" : ""} key={item} onClick={() => setStyle(item)}>{item}</button>)}</div></div><label className="field"><span>客户 / 产品</span><input value={company} onChange={(event) => setCompany(event.target.value)} placeholder="品牌、产品或服务名称" /></label><div className="two-fields"><label className="field"><span>必须出现</span><textarea value={mustInclude} onChange={(event) => setMustInclude(event.target.value)} rows={3} placeholder="产品卖点、场景、文案…" /></label><label className="field"><span>禁止出现</span><textarea value={mustAvoid} onChange={(event) => setMustAvoid(event.target.value)} rows={3} placeholder="禁用元素、表述、颜色…" /></label></div><label className="field"><span>结尾引导</span><input value={cta} onChange={(event) => setCta(event.target.value)} placeholder="例如：收藏这份周末清单" /></label></div>}
-          </section>
+          {view === "brief" && <section className="form-section advanced-section">
+            <button className="advanced-toggle" onClick={() => setAdvanced((value) => !value)}><span><b>+</b><strong>补充要求</strong><small>客户、必备内容、避雷项与结尾引导</small></span><i>{advanced ? "−" : "+"}</i></button>
+            {advanced && <div className="advanced-fields"><label className="field"><span>客户 / 产品</span><input value={company} onChange={(event) => setCompany(event.target.value)} placeholder="品牌、产品或服务名称" /></label><div className="two-fields"><label className="field"><span>必须出现</span><textarea value={mustInclude} onChange={(event) => setMustInclude(event.target.value)} rows={3} placeholder="产品卖点、场景、文案…" /></label><label className="field"><span>禁止出现</span><textarea value={mustAvoid} onChange={(event) => setMustAvoid(event.target.value)} rows={3} placeholder="禁用元素、表述、颜色…" /></label></div><label className="field"><span>结尾引导</span><input value={cta} onChange={(event) => setCta(event.target.value)} placeholder="例如：收藏这份周末清单" /></label></div>}
+          </section>}
+
+          {view === "spec" && <section className="form-section step-form-section spec-form-section">
+            <div className="section-heading"><span className="section-number">03</span><div><h2>成片设置</h2><p>这些设置会冻结到本次生成任务中。</p></div></div>
+            <div className="two-fields"><div className="field"><span>发布平台</span><div className="segmented">{["抖音", "小红书"].map((item) => <button className={platform === item ? "active" : ""} key={item} onClick={() => setPlatform(item)}>{item}</button>)}</div></div><div className="field"><span>成片时长</span><div className="segmented">{[15, 30, 60].map((item) => <button className={duration === item ? "active" : ""} key={item} onClick={() => setDuration(item)}>{item}s</button>)}</div></div></div>
+            <div className="field"><span>画面风格</span><div className="choice-grid styles">{styles.map((item) => <button className={style === item ? "active" : ""} key={item} onClick={() => setStyle(item)}>{item}</button>)}</div></div>
+            <div className="locked-specs"><div><span>画幅</span><strong>9:16 竖屏</strong></div><div><span>清晰度</span><strong>1080 × 1920</strong></div><div><span>帧率</span><strong>24 fps</strong></div><div><span>模型</span><strong>{modelLabel}</strong></div></div>
+          </section>}
         </div>
 
         <aside className="production-dock">
-          <div className="dock-top"><span>本次成片</span><small>PRODUCTION SPEC</small></div>
+          <div className="dock-top"><span>第 {createStep} / 3 步</span><small>PRODUCTION FLOW</small></div>
           <div className="spec-monitor"><div className="monitor-gridlines" /><span>9:16</span><strong>{duration}<i>SEC</i></strong><small>1080 × 1920</small></div>
           <div className="dock-title"><span>创作主题</span><strong>{title}</strong></div>
           <dl className="spec-list"><div><dt>平台</dt><dd>{platform}</dd></div><div><dt>目标</dt><dd>{goal}</dd></div><div><dt>风格</dt><dd>{style}</dd></div><div><dt>生成模型</dt><dd>{modelLabel}</dd></div></dl>
           <div className="cost-box"><div><span>预计平台成本</span><strong>{system.mode === "demo" ? "演示任务 ￥0" : "按真实用量回填"}</strong></div><p>生产模式会在提交前显示估算区间，完成后以平台返回用量为准。</p></div>
-          <label className="rights-check"><input type="checkbox" checked={rightsConfirmed} onChange={(event) => setRightsConfirmed(event.target.checked)} /><span aria-hidden="true">✓</span><p>我确认有权将所提交的素材用于内部分析和视频制作。</p></label>
+          {view === "spec" && <label className="rights-check"><input type="checkbox" checked={rightsConfirmed} onChange={(event) => setRightsConfirmed(event.target.checked)} /><span aria-hidden="true">✓</span><p>我确认有权将所提交的素材用于内部分析和视频制作。</p></label>}
           {message && <div className="form-message" role="alert">{message}</div>}
-          <button className="start-button" disabled={!canStart || submitting} onClick={startProduction}><span>{submitLabel}</span><i>→</i></button>
-          <p className="dock-footnote">提交后自动完成创意分析、素材生成、镜头质检与剪辑。</p>
+          <button className="start-button" disabled={nextDisabled || submitting || !activeProjectId} onClick={nextAction}><span>{nextLabel}</span><i>→</i></button>
+          <p className="dock-footnote">当前步骤保存成功后才会进入下一页。</p>
         </aside>
       </section>
       <footer className="site-footer wrap"><span>镜流 JINGLIU · INTERNAL MVP</span><span>REFERENCE → STORY → FRAME → MASTER</span></footer>
@@ -533,4 +675,8 @@ export function Studio() {
 
 function Topbar({ system, compact = false }: { system: SystemInfo; compact?: boolean }) {
   return <header className={`topbar ${compact ? "compact" : ""}`}><div className="wrap topbar-inner"><div className="brand"><span className="brand-mark"><i /><i /></span><strong>镜流</strong><em>JINGLIU</em></div><nav aria-label="产品导航"><span className="active">新建视频</span><span>制作记录</span></nav><div className={`system-state ${system.mode}`}><span /><strong>{system.mode === "demo" ? "演示环境" : "生产环境"}</strong><small>{system.mode === "demo" ? "接口待配置" : "服务正常"}</small></div></div></header>;
+}
+
+function ProjectLoading({ system, label }: { system: SystemInfo; label: string }) {
+  return <main className="studio-shell loading-shell"><Topbar system={system} compact /><div className="project-loading"><span className="live-dot" /><strong>{label}</strong><p>正在从项目记录恢复当前步骤…</p></div></main>;
 }

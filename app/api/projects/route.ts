@@ -1,14 +1,11 @@
 import { and, desc, eq } from "drizzle-orm";
 import { ensureDatabase, getDb } from "@/db";
 import { projects } from "@/db/schema";
-import { pipelineInfo, submitPipeline, type PipelineInput } from "@/lib/pipeline";
+import { pipelineInfo } from "@/lib/pipeline";
 
 export const dynamic = "force-dynamic";
 
-type CreateProjectBody = Omit<PipelineInput, "projectId" | "title"> & {
-  requestKey?: string;
-  rightsConfirmed?: boolean;
-};
+type CreateProjectBody = { action?: "draft"; requestKey?: string };
 
 function ownerId(request: Request) {
   return request.headers.get("oai-authenticated-user-id") ?? "local-preview";
@@ -25,9 +22,11 @@ function present(row: typeof projects.$inferSelect) {
     id: row.id,
     title: row.title,
     status: row.status,
+    draftStep: row.draftStep,
+    draftVersion: row.draftVersion,
     progress: row.progress,
     runMode: row.runMode,
-    createdAt: row.createdAt,
+    createdAt: row.runStartedAt ?? row.createdAt,
     updatedAt: row.updatedAt,
     input: JSON.parse(row.inputJson),
     result: row.resultJson ? JSON.parse(row.resultJson) : null,
@@ -52,12 +51,9 @@ export async function POST(request: Request) {
       return Response.json({ error: "请求格式必须为 application/json" }, { status: 415 });
     }
     const body = await request.json() as CreateProjectBody;
+    if (body.action !== "draft") return Response.json({ error: "该接口只用于创建草稿" }, { status: 400 });
     const requestKey = request.headers.get("Idempotency-Key") ?? body.requestKey ?? "";
     if (!requestKey || requestKey.length > 128) return Response.json({ error: "缺少有效的 Idempotency-Key" }, { status: 400 });
-    if (!body.rightsConfirmed) return Response.json({ error: "必须确认素材使用权" }, { status: 400 });
-    if (!Array.isArray(body.references) || body.references.length < 1 || body.references.length > 10) return Response.json({ error: "参考视频数量必须为 1～10 个" }, { status: 400 });
-    if (!body.audience?.trim() || !body.goal?.trim()) return Response.json({ error: "目标观众和内容目标不能为空" }, { status: 400 });
-    if (![15, 30, 60].includes(body.duration)) return Response.json({ error: "成片时长仅支持 15、30 或 60 秒" }, { status: 400 });
 
     const db = getDb();
     const owner = ownerId(request);
@@ -69,30 +65,41 @@ export async function POST(request: Request) {
     }
 
     const now = new Date().toISOString();
-    const id = crypto.randomUUID();
-    const title = body.topicMode === "manual" && body.topic?.trim() ? body.topic.trim() : "AI 自动主题 · 参考灵感融合";
-    const input = { ...body, projectId: id, title } as PipelineInput;
-    const snapshot = await submitPipeline(input);
     const info = pipelineInfo();
+    const initialInput = {
+      topicMode: "ai",
+      topic: "",
+      goal: "品牌种草",
+      audience: "20～35 岁，关注品质生活与效率的城市用户",
+      platform: "抖音",
+      duration: 15,
+      ratio: "9:16",
+      style: "真实生活感",
+      company: "",
+      mustInclude: "",
+      mustAvoid: "",
+      cta: "",
+      rightsConfirmed: false,
+      references: [],
+    };
     const row: typeof projects.$inferInsert = {
-      id,
+      id: crypto.randomUUID(),
       ownerId: owner,
       requestKey,
       requestFingerprint,
-      title,
-      status: snapshot.status,
-      progress: snapshot.progress,
+      title: "未命名视频",
+      status: "draft",
+      draftStep: "references",
+      draftVersion: 1,
+      progress: 0,
       runMode: info.mode,
-      providerJobId: snapshot.providerJobId ?? null,
-      inputJson: JSON.stringify(body),
-      resultJson: snapshot.result ? JSON.stringify(snapshot.result) : null,
-      errorJson: snapshot.error ? JSON.stringify(snapshot.error) : null,
+      inputJson: JSON.stringify(initialInput),
       createdAt: now,
       updatedAt: now,
     };
     const [created] = await db.insert(projects).values(row).returning();
-    return Response.json({ project: present(created) }, { status: 202 });
+    return Response.json({ project: present(created) }, { status: 201 });
   } catch (error) {
-    return Response.json({ error: error instanceof Error ? error.message : "任务创建失败" }, { status: 500 });
+    return Response.json({ error: error instanceof Error ? error.message : "草稿创建失败" }, { status: 500 });
   }
 }

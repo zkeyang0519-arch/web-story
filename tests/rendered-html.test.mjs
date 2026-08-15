@@ -18,8 +18,9 @@ test("renders the Jingliu production studio", async () => {
   assert.equal(response.status, 200);
   const html = await response.text();
   assert.match(html, /<title>镜流 · AI 短视频工坊<\/title>/);
-  assert.match(html, /把参考灵感/);
-  assert.match(html, /开始制片/);
+  assert.match(html, /先给我看/);
+  assert.match(html, /参考素材/);
+  assert.match(html, /下一步：创作要求/);
   assert.doesNotMatch(html, /codex-preview|react-loading-skeleton|Your site is taking shape/i);
 });
 
