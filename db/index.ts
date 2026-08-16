@@ -54,6 +54,7 @@ async function bootstrapDatabase() {
       filename TEXT NOT NULL,
       content_type TEXT NOT NULL,
       byte_size INTEGER NOT NULL,
+      multipart_upload_id TEXT,
       status TEXT NOT NULL,
       created_at TEXT NOT NULL
     )`),
@@ -65,6 +66,7 @@ async function bootstrapDatabase() {
     "ALTER TABLE projects ADD COLUMN draft_version INTEGER DEFAULT 1 NOT NULL",
     "ALTER TABLE projects ADD COLUMN run_started_at TEXT",
     "ALTER TABLE uploads ADD COLUMN project_id TEXT",
+    "ALTER TABLE uploads ADD COLUMN multipart_upload_id TEXT",
   ]) {
     try {
       await DB.prepare(statement).run();

@@ -28,6 +28,7 @@ export const uploads = sqliteTable("uploads", {
   filename: text("filename").notNull(),
   contentType: text("content_type").notNull(),
   byteSize: integer("byte_size").notNull(),
+  multipartUploadId: text("multipart_upload_id"),
   status: text("status").notNull(),
   createdAt: text("created_at").notNull(),
 });

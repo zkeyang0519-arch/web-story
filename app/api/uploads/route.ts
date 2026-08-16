@@ -7,6 +7,9 @@ export const dynamic = "force-dynamic";
 
 type Bindings = { MEDIA?: R2Bucket };
 
+const PART_SIZE = 5 * 1024 * 1024;
+const acceptedTypes = new Set(["video/mp4", "video/quicktime", "video/webm"]);
+
 function safeFilename(value: string) {
   return value.normalize("NFKC").replace(/[^\p{L}\p{N}._-]+/gu, "-").slice(0, 120) || "video.mp4";
 }
@@ -16,42 +19,58 @@ export async function POST(request: Request) {
     await ensureDatabase();
     const bindings = env as unknown as Bindings;
     if (!bindings.MEDIA) return Response.json({ error: "对象存储尚未配置" }, { status: 503 });
-    const form = await request.formData();
-    const file = form.get("file");
-    const projectId = form.get("projectId");
-    if (typeof projectId !== "string" || !projectId) return Response.json({ error: "缺少项目标识" }, { status: 400 });
-    if (!(file instanceof File)) return Response.json({ error: "缺少视频文件" }, { status: 400 });
-    if (file.size <= 0 || file.size > 200 * 1024 * 1024) return Response.json({ error: "视频大小必须在 0～200 MB 之间" }, { status: 400 });
-    const accepted = new Set(["video/mp4", "video/quicktime", "video/webm"]);
-    if (!accepted.has(file.type)) return Response.json({ error: "仅支持 MP4、MOV 或 WebM" }, { status: 400 });
+
+    const body = await request.json().catch(() => null) as {
+      projectId?: string;
+      filename?: string;
+      contentType?: string;
+      byteSize?: number;
+    } | null;
+    if (!body?.projectId) return Response.json({ error: "缺少项目标识" }, { status: 400 });
+    if (!body.filename?.trim()) return Response.json({ error: "缺少视频文件名" }, { status: 400 });
+    if (!body.contentType || !acceptedTypes.has(body.contentType)) {
+      return Response.json({ error: "仅支持 MP4、MOV 或 WebM" }, { status: 400 });
+    }
+    if (!Number.isSafeInteger(body.byteSize) || (body.byteSize ?? 0) <= 0) {
+      return Response.json({ error: "视频文件为空或大小无效" }, { status: 400 });
+    }
 
     const owner = request.headers.get("oai-authenticated-user-id") ?? "local-preview";
     const db = getDb();
-    const [project] = await db.select().from(projects).where(and(eq(projects.id, projectId), eq(projects.ownerId, owner), eq(projects.status, "draft"))).limit(1);
+    const [project] = await db.select().from(projects).where(and(
+      eq(projects.id, body.projectId),
+      eq(projects.ownerId, owner),
+      eq(projects.status, "draft"),
+    )).limit(1);
     if (!project) return Response.json({ error: "项目不存在或已经开始制作" }, { status: 404 });
-    const header = new Uint8Array(await file.slice(0, 16).arrayBuffer());
-    const isIsoMedia = String.fromCharCode(...header.slice(4, 8)) === "ftyp";
-    const isWebm = header[0] === 0x1a && header[1] === 0x45 && header[2] === 0xdf && header[3] === 0xa3;
-    if (!isIsoMedia && !isWebm) return Response.json({ error: "文件内容不是有效的 MP4、MOV 或 WebM 视频" }, { status: 400 });
-    const id = crypto.randomUUID();
-    const key = `inputs/${owner}/${projectId}/${id}/${safeFilename(file.name)}`;
-    await bindings.MEDIA.put(key, file.stream(), { httpMetadata: { contentType: file.type }, customMetadata: { uploadId: id, ownerId: owner, projectId } });
-    const head = await bindings.MEDIA.head(key);
-    if (!head || head.size !== file.size) {
-      await bindings.MEDIA.delete(key);
-      return Response.json({ error: "上传校验失败，请重试" }, { status: 500 });
-    }
 
+    const id = crypto.randomUUID();
+    const key = `inputs/${owner}/${body.projectId}/${id}/${safeFilename(body.filename)}`;
+    const multipart = await bindings.MEDIA.createMultipartUpload(key, {
+      httpMetadata: { contentType: body.contentType },
+      customMetadata: { uploadId: id, ownerId: owner, projectId: body.projectId },
+    });
     const now = new Date().toISOString();
-    let created: typeof uploads.$inferSelect;
     try {
-      [created] = await db.insert(uploads).values({ id, ownerId: owner, projectId, objectKey: key, filename: file.name, contentType: file.type, byteSize: file.size, status: "ready", createdAt: now }).returning();
+      await db.insert(uploads).values({
+        id,
+        ownerId: owner,
+        projectId: body.projectId,
+        objectKey: key,
+        filename: body.filename,
+        contentType: body.contentType,
+        byteSize: body.byteSize,
+        multipartUploadId: multipart.uploadId,
+        status: "uploading",
+        createdAt: now,
+      });
     } catch (error) {
-      await bindings.MEDIA.delete(key);
+      await multipart.abort();
       throw error;
     }
-    return Response.json({ upload: { id: created.id, filename: created.filename, byteSize: created.byteSize, status: created.status } }, { status: 201 });
+
+    return Response.json({ upload: { id, partSize: PART_SIZE } }, { status: 201 });
   } catch (error) {
-    return Response.json({ error: error instanceof Error ? error.message : "上传失败" }, { status: 500 });
+    return Response.json({ error: error instanceof Error ? error.message : "无法开始上传" }, { status: 500 });
   }
 }

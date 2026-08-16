@@ -1,0 +1,1 @@
+ALTER TABLE `uploads` ADD `multipart_upload_id` text;

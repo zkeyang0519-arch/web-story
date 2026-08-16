@@ -15,6 +15,13 @@
       "when": 1786800147551,
       "tag": "0001_stale_mysterio",
       "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "6",
+      "when": 1786861731422,
+      "tag": "0002_familiar_shaman",
+      "breakpoints": true
     }
   ]
 }

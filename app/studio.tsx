@@ -95,6 +95,29 @@ function formatBytes(value = 0) {
   return `${(value / 1024 / 1024).toFixed(1)} MB`;
 }
 
+function videoContentType(file: File) {
+  if (file.type === "video/mp4" || file.type === "video/quicktime" || file.type === "video/webm") return file.type;
+  if (/\.mov$/i.test(file.name)) return "video/quicktime";
+  if (/\.webm$/i.test(file.name)) return "video/webm";
+  return "video/mp4";
+}
+
+async function uploadPartWithRetry(url: string, chunk: Blob, attempts = 3) {
+  let lastError = new Error("分片上传失败");
+  for (let attempt = 1; attempt <= attempts; attempt += 1) {
+    try {
+      const response = await fetch(url, { method: "PUT", body: chunk });
+      const result = await response.json().catch(() => null) as { part?: { partNumber: number; etag: string }; error?: string } | null;
+      if (response.ok && result?.part) return result.part;
+      lastError = new Error(result?.error ?? "分片上传失败");
+      if (response.status >= 400 && response.status < 500) break;
+    } catch (error) {
+      lastError = error instanceof Error ? error : lastError;
+    }
+  }
+  throw lastError;
+}
+
 function formatElapsed(createdAt: string) {
   const seconds = Math.max(0, Math.floor((Date.now() - new Date(createdAt).getTime()) / 1000));
   return seconds < 60 ? `${seconds} 秒` : `${Math.floor(seconds / 60)} 分 ${seconds % 60} 秒`;
@@ -229,10 +252,10 @@ export function Studio({ view = "references", projectId }: { view?: StudioView; 
     const current = references.length;
     const accepted = Array.from(files).filter((file) => {
       const validType = file.type.startsWith("video/") || /\.(mp4|mov|webm)$/i.test(file.name);
-      return validType && file.size <= 200 * 1024 * 1024;
+      return validType && file.size > 0;
     });
     if (accepted.length !== Array.from(files).length) {
-      setMessage("部分文件未添加：仅支持 MP4、MOV、WebM，单个不超过 200 MB。 ");
+      setMessage("部分文件未添加：仅支持有效的 MP4、MOV 或 WebM 视频。 ");
     }
     const next = accepted.slice(0, Math.max(0, 10 - current)).map((file) => ({
       id: uid(), kind: "file" as const, name: file.name, file, size: file.size, priority: false, emphasis: ["节奏", "画面"],
@@ -300,17 +323,44 @@ export function Studio({ view = "references", projectId }: { view?: StudioView; 
 
   async function uploadReference(item: ReferenceItem) {
     if (!item.file) return { name: item.name, kind: item.kind, url: item.url, uploadId: item.uploadId, priority: item.priority, emphasis: item.emphasis };
-    const body = new FormData();
-    body.append("file", item.file);
     if (!activeProjectId) throw new Error("草稿尚未准备好，请稍后重试。");
-    body.append("projectId", activeProjectId);
-    const response = await fetch("/api/uploads", { method: "POST", body });
-    if (!response.ok) {
-      const detail = await response.json().catch(() => null) as { error?: string } | null;
-      throw new Error(detail?.error ?? `上传 ${item.name} 失败`);
+    const startResponse = await fetch("/api/uploads", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        projectId: activeProjectId,
+        filename: item.file.name,
+        contentType: videoContentType(item.file),
+        byteSize: item.file.size,
+      }),
+    });
+    const started = await startResponse.json().catch(() => null) as { upload?: { id: string; partSize: number }; error?: string } | null;
+    if (!startResponse.ok || !started?.upload) {
+      throw new Error(started?.error ?? `无法开始上传 ${item.name}`);
     }
-    const data = await response.json() as { upload: { id: string } };
-    return { name: item.name, kind: item.kind, uploadId: data.upload.id, priority: item.priority, emphasis: item.emphasis };
+
+    const { id, partSize } = started.upload;
+    const partCount = Math.ceil(item.file.size / partSize);
+    const parts: { partNumber: number; etag: string }[] = [];
+    for (let partNumber = 1; partNumber <= partCount; partNumber += 1) {
+      const start = (partNumber - 1) * partSize;
+      const chunk = item.file.slice(start, Math.min(start + partSize, item.file.size));
+      const percent = Math.min(99, Math.round((start / item.file.size) * 100));
+      setSubmitLabel(`上传 ${item.name} · ${percent}%`);
+      parts.push(await uploadPartWithRetry(`/api/uploads/${id}/parts/${partNumber}`, chunk));
+    }
+
+    setSubmitLabel(`校验 ${item.name} · 100%`);
+    const completeResponse = await fetch(`/api/uploads/${id}/complete`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ parts }),
+    });
+    const completed = await completeResponse.json().catch(() => null) as { upload?: { id: string }; error?: string } | null;
+    if (!completeResponse.ok || !completed?.upload) {
+      throw new Error(completed?.error ?? `完成 ${item.name} 上传失败`);
+    }
+    return { name: item.name, kind: item.kind, uploadId: completed.upload.id, priority: item.priority, emphasis: item.emphasis };
   }
 
   async function continueFromReferences() {
@@ -619,7 +669,7 @@ export function Studio({ view = "references", projectId }: { view?: StudioView; 
             <div className="section-heading"><span className="section-number">01</span><div><h2>参考内容</h2><p>添加 1～10 个视频，最多标记 3 个重点参考。</p></div><button className="example-button" onClick={loadDemoReferences}>载入示例</button></div>
             <div className={`upload-zone ${isDragging ? "dragging" : ""}`} onDragOver={(event) => { event.preventDefault(); setIsDragging(true); }} onDragLeave={() => setIsDragging(false)} onDrop={(event) => { event.preventDefault(); setIsDragging(false); addFiles(event.dataTransfer.files); }}>
               <input ref={fileInput} type="file" accept="video/mp4,video/quicktime,video/webm" multiple hidden onChange={(event) => event.target.files && addFiles(event.target.files)} />
-              <div className="upload-mark">↑</div><div><strong>拖入参考视频</strong><span>MP4 / MOV / WebM · 单个不超过 200 MB</span></div><button onClick={() => fileInput.current?.click()}>选择文件</button>
+              <div className="upload-mark">↑</div><div><strong>拖入参考视频</strong><span>MP4 / MOV / WebM · 大文件自动分片上传</span></div><button onClick={() => fileInput.current?.click()}>选择文件</button>
             </div>
             <div className="url-row"><span>或</span><input value={urlDraft} onChange={(event) => setUrlDraft(event.target.value)} onKeyDown={(event) => event.key === "Enter" && addUrl()} placeholder="粘贴抖音 / 小红书分享链接" aria-label="参考视频链接" /><button onClick={addUrl}>添加链接</button></div>
             {references.length > 0 && <div className="reference-list">
