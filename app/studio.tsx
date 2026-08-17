@@ -2,6 +2,7 @@
 
 import { useEffect, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
+import { calculateCostQuote, type CostQuote } from "@/lib/cost";
 
 type ReferenceItem = {
   id: string;
@@ -35,7 +36,7 @@ type Project = {
   id: string;
   title: string;
   status: string;
-  draftStep: "references" | "requirements" | "settings" | "locked";
+  draftStep: "references" | "requirements" | "settings" | "quote" | "locked";
   draftVersion: number;
   progress: number;
   runMode: "demo" | "production";
@@ -57,6 +58,9 @@ type Project = {
     mustAvoid?: string;
     cta?: string;
     rightsConfirmed?: boolean;
+    quote?: CostQuote;
+    costConfirmed?: boolean;
+    costConfirmedAt?: string;
     references: ReferenceItem[];
   };
   result?: ProjectResult | null;
@@ -69,7 +73,7 @@ type SystemInfo = {
   storage: boolean;
 };
 
-type StudioView = "references" | "brief" | "spec" | "progress" | "result";
+type StudioView = "references" | "brief" | "spec" | "quote" | "progress" | "result";
 
 const processSteps = [
   { key: "receive", label: "接收并校验参考素材", detail: "确认文件、链接与素材权限", end: 6 },
@@ -156,6 +160,7 @@ export function Studio({ view = "references", projectId }: { view?: StudioView; 
   const [cta, setCta] = useState("");
   const [advanced, setAdvanced] = useState(false);
   const [rightsConfirmed, setRightsConfirmed] = useState(false);
+  const [costAccepted, setCostAccepted] = useState(false);
   const [project, setProject] = useState<Project | null>(null);
   const [system, setSystem] = useState<SystemInfo>({ mode: "demo", provider: "演示适配器", model: "Seedance 2.0 Standard", storage: false });
   const [submitting, setSubmitting] = useState(false);
@@ -207,7 +212,7 @@ export function Studio({ view = "references", projectId }: { view?: StudioView; 
         setProject(loaded);
         draftVersionRef.current = loaded.draftVersion;
         const input = loaded.input;
-        if (input.references) setReferences(input.references.map((item) => ({ ...item, file: undefined, status: "ready", progress: 100, statusText: item.kind === "file" ? "上传完成" : "解析完成" })));
+        if (input.references) setReferences(input.references.map((item) => ({ ...item, file: undefined, status: "ready", progress: 100, statusText: item.kind === "file" ? "上传完成" : "链接检查完成" })));
         if (input.topicMode) setTopicMode(input.topicMode);
         if (typeof input.topic === "string") setTopic(input.topic);
         if (input.goal) setGoal(input.goal);
@@ -220,13 +225,17 @@ export function Studio({ view = "references", projectId }: { view?: StudioView; 
         if (typeof input.mustAvoid === "string") setMustAvoid(input.mustAvoid);
         if (typeof input.cta === "string") setCta(input.cta);
         if (typeof input.rightsConfirmed === "boolean") setRightsConfirmed(input.rightsConfirmed);
-        if (["references", "brief", "spec"].includes(view) && loaded.status !== "draft") {
+        setCostAccepted(false);
+        if (["references", "brief", "spec", "quote"].includes(view) && loaded.status !== "draft") {
           router.replace(loaded.status === "completed" ? `/projects/${loaded.id}/delivery` : `/projects/${loaded.id}/progress`);
           return;
         }
         if (view === "brief" && loaded.draftStep === "references") router.replace(`/projects/${loaded.id}/references`);
         if (view === "spec" && loaded.draftStep === "references") router.replace(`/projects/${loaded.id}/references`);
         if (view === "spec" && loaded.draftStep === "requirements") router.replace(`/projects/${loaded.id}/requirements`);
+        if (view === "quote" && loaded.draftStep === "references") router.replace(`/projects/${loaded.id}/references`);
+        if (view === "quote" && loaded.draftStep === "requirements") router.replace(`/projects/${loaded.id}/requirements`);
+        if (view === "quote" && loaded.draftStep === "settings") router.replace(`/projects/${loaded.id}/settings`);
         if (view === "progress" && loaded.status === "completed") router.replace(`/projects/${loaded.id}/delivery`);
         if (view === "result" && loaded.status !== "completed") router.replace(`/projects/${loaded.id}/progress`);
       })
@@ -280,7 +289,7 @@ export function Studio({ view = "references", projectId }: { view?: StudioView; 
       return setMessage("请输入完整的抖音或小红书分享链接。 ");
     }
     const source = /xiaohongshu|xhslink/i.test(value) ? "小红书参考" : /douyin/i.test(value) ? "抖音参考" : "视频链接";
-    const item: ReferenceItem = { id: uid(), kind: "url", name: `${source} ${references.length + 1}`, url: value, priority: false, emphasis: ["开头", "节奏"], status: value.startsWith("demo://") ? "ready" : "processing", progress: value.startsWith("demo://") ? 100 : 12, statusText: value.startsWith("demo://") ? "解析完成" : "正在解析链接" };
+    const item: ReferenceItem = { id: uid(), kind: "url", name: `${source} ${references.length + 1}`, url: value, priority: false, emphasis: ["开头", "节奏"], status: value.startsWith("demo://") ? "ready" : "processing", progress: value.startsWith("demo://") ? 100 : 12, statusText: value.startsWith("demo://") ? "示例已就绪" : "正在检查链接" };
     setReferences((items) => [...items, item]);
     setUrlDraft("");
     setMessage("");
@@ -289,9 +298,9 @@ export function Studio({ view = "references", projectId }: { view?: StudioView; 
 
   function loadDemoReferences() {
     setReferences([
-      { id: uid(), kind: "url", name: "示例参考 · 清晨咖啡", url: "demo://morning-coffee", priority: true, emphasis: ["开头", "画面"], status: "ready", progress: 100, statusText: "解析完成" },
-      { id: uid(), kind: "url", name: "示例参考 · 城市节奏", url: "demo://city-rhythm", priority: false, emphasis: ["节奏", "声音"], status: "ready", progress: 100, statusText: "解析完成" },
-      { id: uid(), kind: "url", name: "示例参考 · 产品特写", url: "demo://product-detail", priority: false, emphasis: ["画面", "反转"], status: "ready", progress: 100, statusText: "解析完成" },
+      { id: uid(), kind: "url", name: "示例参考 · 清晨咖啡", url: "demo://morning-coffee", priority: true, emphasis: ["开头", "画面"], status: "ready", progress: 100, statusText: "示例已就绪" },
+      { id: uid(), kind: "url", name: "示例参考 · 城市节奏", url: "demo://city-rhythm", priority: false, emphasis: ["节奏", "声音"], status: "ready", progress: 100, statusText: "示例已就绪" },
+      { id: uid(), kind: "url", name: "示例参考 · 产品特写", url: "demo://product-detail", priority: false, emphasis: ["画面", "反转"], status: "ready", progress: 100, statusText: "示例已就绪" },
     ]);
     setTopicMode("ai");
     setGoal("品牌种草");
@@ -334,10 +343,10 @@ export function Studio({ view = "references", projectId }: { view?: StudioView; 
 
   async function parseLinkReference(item: ReferenceItem) {
     if (!activeProjectId || !item.url) {
-      updateReference(item.id, { status: "failed", statusText: "解析失败", error: "草稿尚未准备好" });
+      updateReference(item.id, { status: "failed", statusText: "链接检查失败", error: "草稿尚未准备好" });
       return;
     }
-    updateReference(item.id, { status: "processing", progress: 18, statusText: "正在解析分享链接", error: undefined });
+    updateReference(item.id, { status: "processing", progress: 18, statusText: "正在检查分享链接", error: undefined });
     try {
       const response = await fetch("/api/references/inspect", {
         method: "POST",
@@ -345,14 +354,14 @@ export function Studio({ view = "references", projectId }: { view?: StudioView; 
         body: JSON.stringify({ projectId: activeProjectId, url: item.url }),
       });
       const result = await response.json().catch(() => null) as { reference?: { resolvedUrl?: string; directVideo?: boolean; note?: string }; error?: string } | null;
-      if (!response.ok || !result?.reference) throw new Error(result?.error ?? "链接解析失败");
-      updateReference(item.id, { status: "ready", progress: 100, statusText: result.reference.note ?? "解析完成", resolvedUrl: result.reference.resolvedUrl, directVideo: result.reference.directVideo, error: undefined });
+      if (!response.ok || !result?.reference) throw new Error(result?.error ?? "链接检查失败");
+      updateReference(item.id, { status: "ready", progress: 100, statusText: result.reference.note ?? "链接检查完成", resolvedUrl: result.reference.resolvedUrl, directVideo: result.reference.directVideo, error: undefined });
     } catch (error) {
-      updateReference(item.id, { status: "failed", progress: 100, statusText: "解析失败", error: error instanceof Error ? error.message : "链接解析失败" });
+      updateReference(item.id, { status: "failed", progress: 100, statusText: "链接检查失败", error: error instanceof Error ? error.message : "链接检查失败" });
     }
   }
 
-  async function patchDraft(step: "references" | "requirements" | "settings", data: Record<string, unknown>, advance = false) {
+  async function patchDraft(step: "references" | "requirements" | "settings" | "quote", data: Record<string, unknown>, advance = false) {
     if (!activeProjectId) throw new Error("草稿尚未准备好，请稍后重试。");
     const response = await fetch(`/api/projects/${activeProjectId}`, {
       method: "PATCH",
@@ -411,7 +420,7 @@ export function Studio({ view = "references", projectId }: { view?: StudioView; 
   async function continueFromReferences() {
     setMessage("");
     if (!references.length) return setMessage("请先添加至少一个参考视频。 ");
-    if (references.some((item) => item.status !== "ready")) return setMessage("请等待所有视频上传或链接解析完成。 ");
+    if (references.some((item) => item.status !== "ready")) return setMessage("请等待所有视频上传或链接检查完成。 ");
     setSubmitting(true);
     try {
       setSubmitLabel("保存参考素材");
@@ -441,7 +450,7 @@ export function Studio({ view = "references", projectId }: { view?: StudioView; 
     }
   }
 
-  async function startProduction() {
+  async function continueFromSpec() {
     setMessage("");
     if (!references.length) return setMessage("请先添加至少一个参考视频。 ");
     if (!audience.trim()) return setMessage("请填写目标观众。 ");
@@ -450,9 +459,26 @@ export function Studio({ view = "references", projectId }: { view?: StudioView; 
 
     setSubmitting(true);
     try {
-      setSubmitLabel("创建制作任务");
-      const requestKey = uid("req");
+      setSubmitLabel("计算平台成本");
       await patchDraft("settings", { platform, duration, ratio: "9:16", style, rightsConfirmed }, true);
+      router.push(`/projects/${activeProjectId}/quote`);
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "成本预估失败，请重试。 ");
+    } finally {
+      setSubmitting(false);
+      setSubmitLabel("查看成本");
+    }
+  }
+
+  async function confirmCostAndStart() {
+    setMessage("");
+    if (!costAccepted) return setMessage("请先确认预计平台成本。 ");
+    if (!project?.input.quote) return setMessage("成本预估尚未准备好，请刷新重试。 ");
+    setSubmitting(true);
+    try {
+      setSubmitLabel("确认并创建任务");
+      const requestKey = uid("req");
+      await patchDraft("quote", { accepted: true, quoteVersion: project.input.quote.version }, true);
       if (!activeProjectId) throw new Error("草稿尚未准备好，请稍后重试。");
       const response = await fetch(`/api/projects/${activeProjectId}/generate`, {
         method: "POST",
@@ -469,7 +495,7 @@ export function Studio({ view = "references", projectId }: { view?: StudioView; 
       setMessage(error instanceof Error ? error.message : "任务创建失败，请重试。 ");
     } finally {
       setSubmitting(false);
-      setSubmitLabel("开始制片");
+      setSubmitLabel("确认成本并开始");
     }
   }
 
@@ -522,19 +548,22 @@ export function Studio({ view = "references", projectId }: { view?: StudioView; 
   const shotsDone = project ? Math.min(shotTotal, Math.max(0, Math.round((project.progress - 42) / 58 * shotTotal))) : 0;
   const canBriefContinue = references.length > 0 && Boolean(audience.trim()) && (topicMode === "ai" || Boolean(topic.trim()));
   const canStart = canBriefContinue && rightsConfirmed;
+  const quote = project?.input.quote ?? calculateCostQuote(references.length, duration);
   const title = topicMode === "manual" && topic.trim() ? topic.trim() : "AI 将根据参考视频自动定题";
   const modelLabel = system.model || "Seedance 2.0 Standard";
-  const createStep = view === "references" ? 1 : view === "brief" ? 2 : 3;
+  const createStep = view === "references" ? 1 : view === "brief" ? 2 : view === "spec" ? 3 : 4;
   const pageCopy = view === "references"
     ? { eyebrow: "STEP 01 / REFERENCE", first: "先给我看，", second: "你喜欢什么。", lead: "添加参考视频并标记你喜欢的部分。完成后，再进入创作要求。" }
     : view === "brief"
       ? { eyebrow: "STEP 02 / CREATIVE BRIEF", first: "说清楚，", second: "这条视频要打动谁。", lead: "确定主题来源、内容目标和目标观众，然后再确认最终成片规格。" }
-      : { eyebrow: "STEP 03 / PRODUCTION SPEC", first: "最后确认，", second: "成片怎么交付。", lead: "确认平台、时长、画面风格与素材权利后，系统才会正式开始制作。" };
-  const nextAction = view === "references" ? continueFromReferences : view === "brief" ? continueFromBrief : startProduction;
-  const nextDisabled = view === "references" ? !referencesReady : view === "brief" ? !canBriefContinue : !canStart;
-  const nextLabel = submitting ? submitLabel : view === "references" ? referencesProcessing ? "等待素材处理完成" : "下一步：创作要求" : view === "brief" ? "下一步：成片设置" : "开始制片";
+      : view === "spec"
+        ? { eyebrow: "STEP 03 / PRODUCTION SPEC", first: "确定规格，", second: "再计算成本。", lead: "确认平台、时长、画面风格与素材权利。下一页先展示成本，不会启动视频解析。" }
+        : { eyebrow: "STEP 04 / COST APPROVAL", first: "先看成本，", second: "确认后才开工。", lead: "下面是本次解析与生成的预计平台成本。只有你明确确认后，系统才会开始解析参考视频。" };
+  const nextAction = view === "references" ? continueFromReferences : view === "brief" ? continueFromBrief : view === "spec" ? continueFromSpec : confirmCostAndStart;
+  const nextDisabled = view === "references" ? !referencesReady : view === "brief" ? !canBriefContinue : view === "spec" ? !canStart : !costAccepted;
+  const nextLabel = submitting ? submitLabel : view === "references" ? referencesProcessing ? "等待素材处理完成" : "下一步：创作要求" : view === "brief" ? "下一步：成片设置" : view === "spec" ? "下一步：查看成本" : "确认成本并开始";
 
-  if (projectId && ["references", "brief", "spec"].includes(view) && !project) {
+  if (projectId && ["references", "brief", "spec", "quote"].includes(view) && !project) {
     return <ProjectLoading system={system} label="正在恢复制片草稿" />;
   }
 
@@ -694,7 +723,7 @@ export function Studio({ view = "references", projectId }: { view?: StudioView; 
     <main className="studio-shell create-shell">
       <Topbar system={system} />
       <nav className="wizard-bar wrap" aria-label="新建视频步骤">
-        {["参考素材", "创作要求", "成片设置"].map((label, index) => {
+        {["参考素材", "创作要求", "成片设置", "成本确认"].map((label, index) => {
           const step = index + 1;
           const state = step < createStep ? "done" : step === createStep ? "active" : "pending";
           return <div className={`wizard-step ${state}`} key={label}><span>{state === "done" ? "✓" : String(step).padStart(2, "0")}</span><strong>{label}</strong><i /></div>;
@@ -702,7 +731,7 @@ export function Studio({ view = "references", projectId }: { view?: StudioView; 
       </nav>
       <section className="hero wrap">
         <div className="hero-copy">
-          {view !== "references" && <button className="step-back" onClick={() => router.push(view === "brief" ? `/projects/${activeProjectId}/references` : `/projects/${activeProjectId}/requirements`)}>← 返回上一步</button>}
+          {view !== "references" && <button className="step-back" onClick={() => router.push(view === "brief" ? `/projects/${activeProjectId}/references` : view === "spec" ? `/projects/${activeProjectId}/requirements` : `/projects/${activeProjectId}/settings`)}>← 返回上一步</button>}
           <p className="eyebrow">{pageCopy.eyebrow}</p>
           <h1>{pageCopy.first}<br /><em>{pageCopy.second}</em></h1>
           <p className="hero-lead">{pageCopy.lead}</p>
@@ -757,15 +786,27 @@ export function Studio({ view = "references", projectId }: { view?: StudioView; 
             <div className="field"><span>画面风格</span><div className="choice-grid styles">{styles.map((item) => <button className={style === item ? "active" : ""} key={item} onClick={() => setStyle(item)}>{item}</button>)}</div></div>
             <div className="locked-specs"><div><span>画幅</span><strong>9:16 竖屏</strong></div><div><span>清晰度</span><strong>1080 × 1920</strong></div><div><span>帧率</span><strong>24 fps</strong></div><div><span>模型</span><strong>{modelLabel}</strong></div></div>
           </section>}
+
+          {view === "quote" && <section className="form-section step-form-section quote-form-section">
+            <div className="section-heading"><span className="section-number">04</span><div><h2>成本确认</h2><p>以下为真实平台成本预估，不包含销售利润。</p></div></div>
+            <div className="quote-total"><span>本次预计平台成本</span><strong>￥{quote.totalMin.toFixed(2)} <i>—</i> ￥{quote.totalMax.toFixed(2)}</strong><p>实际金额以火山方舟任务完成后返回的用量为准。</p></div>
+            <div className="quote-breakdown">
+              <div><span><b>01</b>参考视频 AI 解析</span><strong>￥{quote.analysis.min.toFixed(2)} — ￥{quote.analysis.max.toFixed(2)}</strong><small>{quote.referenceCount} 个参考视频 · 解析高光、节奏与创意机制</small></div>
+              <div><span><b>02</b>Seedance 视频生成</span><strong>￥{quote.generation.min.toFixed(2)} — ￥{quote.generation.max.toFixed(2)}</strong><small>{quote.model} · {quote.duration} 秒 · 9:16 · 1080p</small></div>
+              <div><span><b>03</b>成片归档与存储</span><strong>￥{quote.storage.min.toFixed(2)} — ￥{quote.storage.max.toFixed(2)}</strong><small>下载、完整性校验并保存到对象存储</small></div>
+            </div>
+            <div className="quote-gate"><span>尚未启动任何 AI 视频解析或生成</span><p>点击确认后才会依次启动参考解析、创意融合和 Seedance 生成。任一步失败都会立即停止。</p></div>
+          </section>}
         </div>
 
         <aside className="production-dock">
-          <div className="dock-top"><span>第 {createStep} / 3 步</span><small>PRODUCTION FLOW</small></div>
+          <div className="dock-top"><span>第 {createStep} / 4 步</span><small>PRODUCTION FLOW</small></div>
           <div className="spec-monitor"><div className="monitor-gridlines" /><span>9:16</span><strong>{duration}<i>SEC</i></strong><small>1080 × 1920</small></div>
           <div className="dock-title"><span>创作主题</span><strong>{title}</strong></div>
           <dl className="spec-list"><div><dt>平台</dt><dd>{platform}</dd></div><div><dt>目标</dt><dd>{goal}</dd></div><div><dt>风格</dt><dd>{style}</dd></div><div><dt>生成模型</dt><dd>{modelLabel}</dd></div></dl>
-          <div className="cost-box"><div><span>预计平台成本</span><strong>{system.mode === "demo" ? "演示任务 ￥0" : "按真实用量回填"}</strong></div><p>生产模式会在提交前显示估算区间，完成后以平台返回用量为准。</p></div>
+          <div className="cost-box"><div><span>预计平台成本</span><strong>￥{quote.totalMin.toFixed(2)}—￥{quote.totalMax.toFixed(2)}</strong></div><p>{view === "quote" ? "等待你确认；当前尚未启动 AI 视频解析。" : "进入成本确认页后，确认才会启动解析与生成。"}</p></div>
           {view === "spec" && <label className="rights-check"><input type="checkbox" checked={rightsConfirmed} onChange={(event) => setRightsConfirmed(event.target.checked)} /><span aria-hidden="true">✓</span><p>我确认有权将所提交的素材用于内部分析和视频制作。</p></label>}
+          {view === "quote" && <label className="rights-check cost-confirm"><input type="checkbox" checked={costAccepted} onChange={(event) => setCostAccepted(event.target.checked)} /><span aria-hidden="true">✓</span><p>我已了解预计平台成本区间，同意确认后开始解析参考视频并生成成片。</p></label>}
           {message && <div className="form-message" role="alert">{message}</div>}
           <button className="start-button" disabled={nextDisabled || submitting || !activeProjectId} onClick={nextAction}><span>{nextLabel}</span><i>→</i></button>
           <p className="dock-footnote">当前步骤保存成功后才会进入下一页。</p>

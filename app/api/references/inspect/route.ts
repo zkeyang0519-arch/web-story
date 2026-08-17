@@ -60,7 +60,7 @@ export async function POST(request: Request) {
 
     let resolvedUrl = url.toString();
     let extractedVideoUrl: string | null = null;
-    let note = "分享链接已解析";
+    let note = "分享链接检查完成";
     try {
       const response = await fetch(url, {
         redirect: "follow",
@@ -94,6 +94,6 @@ export async function POST(request: Request) {
       },
     });
   } catch (error) {
-    return Response.json({ error: error instanceof Error ? error.message : "链接解析失败" }, { status: 500 });
+    return Response.json({ error: error instanceof Error ? error.message : "链接检查失败" }, { status: 500 });
   }
 }

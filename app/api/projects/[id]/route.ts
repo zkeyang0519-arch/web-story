@@ -2,11 +2,12 @@ import { and, eq } from "drizzle-orm";
 import { ensureDatabase, getDb } from "@/db";
 import { projects, uploads } from "@/db/schema";
 import { readPipeline, type ArkPipelineState, type PipelineInput } from "@/lib/pipeline";
+import { calculateCostQuote } from "@/lib/cost";
 
 export const dynamic = "force-dynamic";
 
 type PatchDraftBody = {
-  step?: "references" | "requirements" | "settings";
+  step?: "references" | "requirements" | "settings" | "quote";
   data?: Record<string, unknown>;
   advance?: boolean;
   draftVersion?: number;
@@ -145,7 +146,21 @@ export async function PATCH(request: Request, context: { params: Promise<{ id: s
       if (!["抖音", "小红书"].includes(String(body.data.platform)) || Number(body.data.duration) !== 15 || !String(body.data.style ?? "").trim()) return Response.json({ error: "MVP 当前固定生成 15 秒成片，请检查平台、时长或风格" }, { status: 400 });
       if (body.advance && body.data.rightsConfirmed !== true) return Response.json({ error: "必须确认素材使用权" }, { status: 400 });
       Object.assign(input, body.data, { ratio: "9:16" });
-      draftStep = "settings";
+      input.quote = calculateCostQuote(Array.isArray(input.references) ? input.references.length : 0, Number(body.data.duration));
+      input.costConfirmed = false;
+      delete input.costConfirmedAt;
+      draftStep = body.advance ? "quote" : "settings";
+    }
+
+    if (body.step === "quote") {
+      if (row.draftStep !== "quote") return Response.json({ error: "请先完成成片设置并获取成本预估" }, { status: 409 });
+      if (body.data.accepted !== true) return Response.json({ error: "请先确认预计平台成本" }, { status: 400 });
+      const quote = calculateCostQuote(Array.isArray(input.references) ? input.references.length : 0, Number(input.duration));
+      if (body.data.quoteVersion !== quote.version) return Response.json({ error: "成本预估已更新，请刷新后重新确认" }, { status: 409 });
+      input.quote = quote;
+      input.costConfirmed = true;
+      input.costConfirmedAt = new Date().toISOString();
+      draftStep = "quote";
     }
 
     const [updated] = await db.update(projects).set({ title, draftStep, draftVersion: row.draftVersion + 1, inputJson: JSON.stringify(input), updatedAt: new Date().toISOString() }).where(and(eq(projects.id, id), eq(projects.ownerId, owner), eq(projects.draftVersion, row.draftVersion))).returning();
