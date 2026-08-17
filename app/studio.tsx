@@ -236,6 +236,10 @@ export function Studio({ view = "references", projectId }: { view?: StudioView; 
         if (view === "quote" && loaded.draftStep === "references") router.replace(`/projects/${loaded.id}/references`);
         if (view === "quote" && loaded.draftStep === "requirements") router.replace(`/projects/${loaded.id}/requirements`);
         if (view === "quote" && loaded.draftStep === "settings") router.replace(`/projects/${loaded.id}/settings`);
+        if (view === "progress" && loaded.status === "draft") {
+          const draftRoute = loaded.draftStep === "requirements" ? "requirements" : loaded.draftStep === "settings" ? "settings" : loaded.draftStep === "quote" ? "quote" : "references";
+          router.replace(`/projects/${loaded.id}/${draftRoute}`);
+        }
         if (view === "progress" && loaded.status === "completed") router.replace(`/projects/${loaded.id}/delivery`);
         if (view === "result" && loaded.status !== "completed") router.replace(`/projects/${loaded.id}/progress`);
       })
