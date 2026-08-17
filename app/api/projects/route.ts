@@ -2,6 +2,7 @@ import { and, desc, eq } from "drizzle-orm";
 import { ensureDatabase, getDb } from "@/db";
 import { projects } from "@/db/schema";
 import { pipelineInfo } from "@/lib/pipeline";
+import { presentProject } from "@/lib/project-view";
 
 export const dynamic = "force-dynamic";
 
@@ -17,35 +18,12 @@ async function fingerprint(value: unknown) {
   return Array.from(new Uint8Array(digest)).map((byte) => byte.toString(16).padStart(2, "0")).join("");
 }
 
-function present(row: typeof projects.$inferSelect) {
-  const pipeline = row.pipelineJson ? JSON.parse(row.pipelineJson) as { phase?: string; events?: unknown[]; keyframe?: { objectKey?: string; model?: string; size?: string } } : null;
-  return {
-    id: row.id,
-    title: row.title,
-    status: row.status,
-    draftStep: row.draftStep,
-    draftVersion: row.draftVersion,
-    progress: row.progress,
-    runMode: row.runMode,
-    pipelinePhase: pipeline?.phase ?? null,
-    keyframeUrl: pipeline?.keyframe?.objectKey ? `/api/media/${encodeURIComponent(pipeline.keyframe.objectKey)}` : null,
-    keyframeModel: pipeline?.keyframe?.model ?? null,
-    keyframeSize: pipeline?.keyframe?.size ?? null,
-    activity: pipeline?.events ?? [],
-    error: row.errorJson ? JSON.parse(row.errorJson) : null,
-    createdAt: row.runStartedAt ?? row.createdAt,
-    updatedAt: row.updatedAt,
-    input: JSON.parse(row.inputJson),
-    result: row.resultJson ? JSON.parse(row.resultJson) : null,
-  };
-}
-
 export async function GET(request: Request) {
   try {
     await ensureDatabase();
     const db = getDb();
     const rows = await db.select().from(projects).where(eq(projects.ownerId, ownerId(request))).orderBy(desc(projects.createdAt)).limit(12);
-    return Response.json({ projects: rows.map(present) });
+    return Response.json({ projects: rows.map(presentProject) });
   } catch (error) {
     return Response.json({ error: error instanceof Error ? error.message : "读取任务失败" }, { status: 500 });
   }
@@ -68,7 +46,7 @@ export async function POST(request: Request) {
     const [existing] = await db.select().from(projects).where(and(eq(projects.ownerId, owner), eq(projects.requestKey, requestKey))).limit(1);
     if (existing) {
       if (existing.requestFingerprint !== requestFingerprint) return Response.json({ error: "同一个幂等键不能用于不同请求" }, { status: 409 });
-      return Response.json({ project: present(existing) });
+      return Response.json({ project: presentProject(existing) });
     }
 
     const now = new Date().toISOString();
@@ -105,7 +83,7 @@ export async function POST(request: Request) {
       updatedAt: now,
     };
     const [created] = await db.insert(projects).values(row).returning();
-    return Response.json({ project: present(created) }, { status: 201 });
+    return Response.json({ project: presentProject(created) }, { status: 201 });
   } catch (error) {
     return Response.json({ error: error instanceof Error ? error.message : "草稿创建失败" }, { status: 500 });
   }

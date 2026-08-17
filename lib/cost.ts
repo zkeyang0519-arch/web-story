@@ -1,11 +1,11 @@
 export type CostQuote = {
-  version: "mvp-platform-cost-v3";
+  version: "mvp-platform-cost-v5";
   currency: "CNY";
   referenceCount: number;
   duration: number;
   model: "Seedance 2.0 Standard";
   analysis: { min: number; max: number };
-  keyframe: { min: number; max: number };
+  storyboard: { count: number; unit: number; min: number; max: number };
   generation: { min: number; max: number };
   storage: { min: number; max: number };
   totalMin: number;
@@ -19,22 +19,22 @@ function money(value: number) {
 export function calculateCostQuote(referenceCount: number, duration: number): CostQuote {
   const count = Math.max(1, Math.min(10, Math.round(referenceCount)));
   const seconds = duration === 15 ? 15 : duration;
-  const analysis = { min: money(count * 0.08), max: money(count * 0.25) };
-  const keyframe = { min: 0.22, max: 0.22 };
+  const analysis = { min: money(count * 0.08 + 0.4), max: money(count * 0.25 + 2.5) };
+  const storyboard = { count: 4, unit: 0.22, min: 0.88, max: 0.88 };
   const generationFactor = seconds / 15;
   const generation = { min: money(28 * generationFactor), max: money(42 * generationFactor) };
   const storage = { min: 0.05, max: 0.15 };
   return {
-    version: "mvp-platform-cost-v3",
+    version: "mvp-platform-cost-v5",
     currency: "CNY",
     referenceCount: count,
     duration: seconds,
     model: "Seedance 2.0 Standard",
     analysis,
-    keyframe,
+    storyboard,
     generation,
     storage,
-    totalMin: money(analysis.min + keyframe.min + generation.min + storage.min),
-    totalMax: money(analysis.max + keyframe.max + generation.max + storage.max),
+    totalMin: money(analysis.min + storyboard.min + generation.min + storage.min),
+    totalMax: money(analysis.max + storyboard.max + generation.max + storage.max),
   };
 }

@@ -31,7 +31,8 @@ export async function POST(request: Request) {
     if (!body.contentType || !acceptedTypes.has(body.contentType)) {
       return Response.json({ error: "仅支持 MP4、MOV 或 WebM" }, { status: 400 });
     }
-    if (!Number.isSafeInteger(body.byteSize) || (body.byteSize ?? 0) <= 0) {
+    const byteSize = body.byteSize;
+    if (typeof byteSize !== "number" || !Number.isSafeInteger(byteSize) || byteSize <= 0) {
       return Response.json({ error: "视频文件为空或大小无效" }, { status: 400 });
     }
 
@@ -59,7 +60,7 @@ export async function POST(request: Request) {
         objectKey: key,
         filename: body.filename,
         contentType: body.contentType,
-        byteSize: body.byteSize,
+        byteSize,
         multipartUploadId: multipart.uploadId,
         status: "uploading",
         createdAt: now,

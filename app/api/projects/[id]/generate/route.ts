@@ -3,34 +3,12 @@ import { ensureDatabase, getDb } from "@/db";
 import { projects, uploads } from "@/db/schema";
 import { pipelineInfo, submitPipeline, type PipelineInput } from "@/lib/pipeline";
 import { calculateCostQuote, type CostQuote } from "@/lib/cost";
+import { presentProject } from "@/lib/project-view";
 
 export const dynamic = "force-dynamic";
 
 function ownerId(request: Request) {
   return request.headers.get("oai-authenticated-user-id") ?? "local-preview";
-}
-
-function present(row: typeof projects.$inferSelect) {
-  const pipeline = row.pipelineJson ? JSON.parse(row.pipelineJson) as { phase?: string; events?: unknown[]; keyframe?: { objectKey?: string; model?: string; size?: string } } : null;
-  return {
-    id: row.id,
-    title: row.title,
-    status: row.status,
-    draftStep: row.draftStep,
-    draftVersion: row.draftVersion,
-    progress: row.progress,
-    runMode: row.runMode,
-    pipelinePhase: pipeline?.phase ?? null,
-    keyframeUrl: pipeline?.keyframe?.objectKey ? `/api/media/${encodeURIComponent(pipeline.keyframe.objectKey)}` : null,
-    keyframeModel: pipeline?.keyframe?.model ?? null,
-    keyframeSize: pipeline?.keyframe?.size ?? null,
-    activity: pipeline?.events ?? [],
-    error: row.errorJson ? JSON.parse(row.errorJson) : null,
-    createdAt: row.runStartedAt ?? row.createdAt,
-    updatedAt: row.updatedAt,
-    input: JSON.parse(row.inputJson),
-    result: row.resultJson ? JSON.parse(row.resultJson) : null,
-  };
 }
 
 export async function POST(request: Request, context: { params: Promise<{ id: string }> }) {
@@ -46,7 +24,7 @@ export async function POST(request: Request, context: { params: Promise<{ id: st
     const owner = ownerId(request);
     const [row] = await db.select().from(projects).where(and(eq(projects.id, id), eq(projects.ownerId, owner))).limit(1);
     if (!row) return Response.json({ error: "任务不存在" }, { status: 404 });
-    if (row.status !== "draft") return Response.json({ project: present(row) });
+    if (row.status !== "draft") return Response.json({ project: presentProject(row) });
     if (row.draftVersion !== body.draftVersion) return Response.json({ error: "草稿已更新，请刷新确认后重试" }, { status: 409 });
     if (row.draftStep !== "quote") return Response.json({ error: "请按顺序完成设置并确认预计平台成本" }, { status: 409 });
 
@@ -80,7 +58,7 @@ export async function POST(request: Request, context: { params: Promise<{ id: st
       updatedAt: now,
     }).where(and(eq(projects.id, id), eq(projects.ownerId, owner), eq(projects.status, "draft"), eq(projects.draftVersion, row.draftVersion))).returning();
     if (!updated) return Response.json({ error: "任务已经开始制作，请勿重复提交" }, { status: 409 });
-    return Response.json({ project: present(updated) }, { status: 202 });
+    return Response.json({ project: presentProject(updated) }, { status: 202 });
   } catch (error) {
     return Response.json({ error: error instanceof Error ? error.message : "任务启动失败" }, { status: 500 });
   }

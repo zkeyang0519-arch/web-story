@@ -77,10 +77,17 @@ export async function POST(request: Request) {
       } else if (response.ok && contentType.includes("text/html")) {
         extractedVideoUrl = findVideoUrl((await response.text()).slice(0, 3_000_000));
       } else {
-        note = "已识别分享链接；平台限制了页面抓取，生成阶段将使用链接信息继续处理";
+        note = "平台没有返回可解析的视频文件";
       }
     } catch {
-      note = "已识别分享链接；平台限制了自动访问，生成阶段将使用链接信息继续处理";
+      note = "平台限制了自动访问";
+    }
+
+    if (!extractedVideoUrl) {
+      return Response.json({
+        error: `${note}。为了避免生成无关内容，请下载原视频后直接上传。`,
+        code: "REFERENCE_VIDEO_UNAVAILABLE",
+      }, { status: 422 });
     }
 
     const source = /xiaohongshu|xhslink/i.test(resolvedUrl) ? "xiaohongshu" : "douyin";
@@ -88,9 +95,9 @@ export async function POST(request: Request) {
       reference: {
         status: "ready",
         source,
-        resolvedUrl: extractedVideoUrl || resolvedUrl,
-        directVideo: Boolean(extractedVideoUrl),
-        note,
+        resolvedUrl: extractedVideoUrl,
+        directVideo: true,
+        note: "视频文件解析完成",
       },
     });
   } catch (error) {

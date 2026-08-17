@@ -37,3 +37,25 @@ test("keeps production capabilities declared", async () => {
   assert.match(schema, /projects/);
   assert.match(schema, /uploads/);
 });
+
+test("keeps every paid generation stage behind the three review gates", async () => {
+  const [pipeline, projectRoute, reviewUi, referenceInspector, cost] = await Promise.all([
+    readFile(new URL("../lib/pipeline.ts", import.meta.url), "utf8"),
+    readFile(new URL("../app/api/projects/[id]/route.ts", import.meta.url), "utf8"),
+    readFile(new URL("../app/review-workflow.tsx", import.meta.url), "utf8"),
+    readFile(new URL("../app/api/references/inspect/route.ts", import.meta.url), "utf8"),
+    readFile(new URL("../lib/cost.ts", import.meta.url), "utf8"),
+  ]);
+  assert.match(pipeline, /awaiting_creative_review/);
+  assert.match(pipeline, /awaiting_image_plan/);
+  assert.match(pipeline, /awaiting_canvas_review/);
+  assert.match(pipeline, /role: "reference_image"/);
+  assert.match(pipeline, /reviewStoryboardImages/);
+  assert.match(pipeline, /reviewFinalVideo/);
+  assert.match(pipeline, /23 \* 60 \* 60 \* 1000/);
+  assert.match(projectRoute, /"awaiting_review"/);
+  assert.match(reviewUi, /图片占位符/);
+  assert.match(reviewUi, /确认画布，开始生成视频/);
+  assert.match(referenceInspector, /REFERENCE_VIDEO_UNAVAILABLE/);
+  assert.match(cost, /storyboard: \{ count: number/);
+});

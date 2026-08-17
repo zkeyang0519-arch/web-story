@@ -3,6 +3,7 @@ import { ensureDatabase, getDb } from "@/db";
 import { projects, uploads } from "@/db/schema";
 import { readPipeline, type ArkPipelineState, type PipelineInput } from "@/lib/pipeline";
 import { calculateCostQuote } from "@/lib/cost";
+import { presentProject } from "@/lib/project-view";
 
 export const dynamic = "force-dynamic";
 
@@ -17,29 +18,6 @@ function ownerId(request: Request) {
   return request.headers.get("oai-authenticated-user-id") ?? "local-preview";
 }
 
-function present(row: typeof projects.$inferSelect) {
-  const pipeline = row.pipelineJson ? JSON.parse(row.pipelineJson) as { phase?: string; events?: unknown[]; keyframe?: { objectKey?: string; model?: string; size?: string } } : null;
-  return {
-    id: row.id,
-    title: row.title,
-    status: row.status,
-    draftStep: row.draftStep,
-    draftVersion: row.draftVersion,
-    progress: row.progress,
-    runMode: row.runMode,
-    pipelinePhase: pipeline?.phase ?? null,
-    keyframeUrl: pipeline?.keyframe?.objectKey ? `/api/media/${encodeURIComponent(pipeline.keyframe.objectKey)}` : null,
-    keyframeModel: pipeline?.keyframe?.model ?? null,
-    keyframeSize: pipeline?.keyframe?.size ?? null,
-    activity: pipeline?.events ?? [],
-    error: row.errorJson ? JSON.parse(row.errorJson) : null,
-    createdAt: row.runStartedAt ?? row.createdAt,
-    updatedAt: row.updatedAt,
-    input: JSON.parse(row.inputJson),
-    result: row.resultJson ? JSON.parse(row.resultJson) : null,
-  };
-}
-
 export async function GET(request: Request, context: { params: Promise<{ id: string }> }) {
   try {
     await ensureDatabase();
@@ -48,13 +26,13 @@ export async function GET(request: Request, context: { params: Promise<{ id: str
     const [row] = await db.select().from(projects).where(and(eq(projects.id, id), eq(projects.ownerId, ownerId(request)))).limit(1);
     if (!row) return Response.json({ error: "任务不存在" }, { status: 404 });
 
-    if (!["draft", "completed", "failed", "cancelled"].includes(row.status)) {
+    if (!["draft", "awaiting_review", "completed", "failed", "cancelled"].includes(row.status)) {
       const pipelineState = row.pipelineJson ? JSON.parse(row.pipelineJson) as ArkPipelineState & { _lock?: { token: string; until: number } } : null;
-      if (pipelineState?._lock && pipelineState._lock.until > Date.now()) return Response.json({ project: present(row) });
+      if (pipelineState?._lock && pipelineState._lock.until > Date.now()) return Response.json({ project: presentProject(row) });
       const unlockedState = pipelineState ? { ...pipelineState } : null;
       if (unlockedState) delete unlockedState._lock;
       const lockToken = crypto.randomUUID();
-      const lockedJson = unlockedState ? JSON.stringify({ ...unlockedState, _lock: { token: lockToken, until: Date.now() + 120_000 } }) : null;
+      const lockedJson = unlockedState ? JSON.stringify({ ...unlockedState, _lock: { token: lockToken, until: Date.now() + 600_000 } }) : null;
       let lockedRow = row;
       if (row.runMode === "production" && row.pipelineJson && lockedJson) {
         const [acquired] = await db.update(projects).set({ pipelineJson: lockedJson }).where(and(
@@ -62,7 +40,7 @@ export async function GET(request: Request, context: { params: Promise<{ id: str
           eq(projects.ownerId, ownerId(request)),
           eq(projects.pipelineJson, row.pipelineJson),
         )).returning();
-        if (!acquired) return Response.json({ project: present(row) });
+        if (!acquired) return Response.json({ project: presentProject(row) });
         lockedRow = acquired;
       }
       const input = { ...JSON.parse(row.inputJson), projectId: row.id, title: row.title } as PipelineInput;
@@ -87,13 +65,13 @@ export async function GET(request: Request, context: { params: Promise<{ id: str
         }).where(and(
           eq(projects.id, id),
           eq(projects.ownerId, ownerId(request)),
-          row.runMode === "production" && lockedJson ? eq(projects.pipelineJson, lockedRow.pipelineJson) : eq(projects.status, row.status),
+          row.runMode === "production" && lockedJson ? eq(projects.pipelineJson, lockedRow.pipelineJson ?? lockedJson) : eq(projects.status, row.status),
         )).returning();
-        if (!updated) return Response.json({ project: present(row) });
-        return Response.json({ project: present(updated) });
+        if (!updated) return Response.json({ project: presentProject(row) });
+        return Response.json({ project: presentProject(updated) });
       }
     }
-    return Response.json({ project: present(row) });
+    return Response.json({ project: presentProject(row) });
   } catch (error) {
     return Response.json({ error: error instanceof Error ? error.message : "读取任务失败" }, { status: 500 });
   }
@@ -168,7 +146,7 @@ export async function PATCH(request: Request, context: { params: Promise<{ id: s
 
     const [updated] = await db.update(projects).set({ title, draftStep, draftVersion: row.draftVersion + 1, inputJson: JSON.stringify(input), updatedAt: new Date().toISOString() }).where(and(eq(projects.id, id), eq(projects.ownerId, owner), eq(projects.draftVersion, row.draftVersion))).returning();
     if (!updated) return Response.json({ error: "草稿已被更新，请刷新后重试" }, { status: 409 });
-    return Response.json({ project: present(updated) });
+    return Response.json({ project: presentProject(updated) });
   } catch (error) {
     return Response.json({ error: error instanceof Error ? error.message : "草稿保存失败" }, { status: 500 });
   }

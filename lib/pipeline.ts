@@ -14,6 +14,7 @@ export type PipelineStatus =
   | "post_processing"
   | "final_checking"
   | "completed"
+  | "awaiting_review"
   | "needs_action"
   | "failed"
   | "cancelled";
@@ -45,7 +46,7 @@ export type PipelineInput = {
   references: Array<Record<string, unknown>>;
 };
 
-type CreativeCard = {
+export type CreativeCard = {
   theme?: string;
   concept?: string;
   hook?: string;
@@ -57,6 +58,47 @@ type CreativeCard = {
   quality_risks?: string[];
 };
 
+export type StoryboardFrame = {
+  id: string;
+  order: number;
+  time_range: string;
+  title: string;
+  narrative_goal: string;
+  prompt: string;
+  motion: string;
+};
+
+export type ImagePlan = {
+  continuity_anchor: string;
+  frames: StoryboardFrame[];
+};
+
+export type StoryboardImage = {
+  frameId: string;
+  order: number;
+  sourceUrl: string;
+  objectKey: string;
+  size?: string;
+  model?: string;
+  cost: number;
+  generatedAt: string;
+};
+
+export type QualityReport = {
+  passed: boolean;
+  brief_alignment: number;
+  visual_consistency: number;
+  constraint_coverage: number;
+  issues: string[];
+  summary: string;
+};
+
+export type CanvasPlan = {
+  frames: Array<{ frameId: string; order: number; motion: string }>;
+  transitions: Array<{ fromFrameId: string; toFrameId: string; description: string }>;
+  confirmedAt?: string;
+};
+
 export type PipelineActivityEvent = {
   id: string;
   phase: string;
@@ -66,13 +108,37 @@ export type PipelineActivityEvent = {
 };
 
 export type ArkPipelineState = {
-  phase: "ingesting" | "waiting_file" | "synthesizing" | "generating_keyframe" | "submitting_video" | "polling_video";
+  phase:
+    | "ingesting"
+    | "waiting_file"
+    | "synthesizing"
+    | "awaiting_creative_review"
+    | "planning_images"
+    | "awaiting_image_plan"
+    | "generating_images"
+    | "reviewing_images"
+    | "awaiting_canvas_review"
+    | "submitting_video"
+    | "polling_video"
+    | "reviewing_video";
+  revision: number;
   referenceIndex: number;
   analyses: Array<Record<string, unknown>>;
   currentFileId?: string;
   creative?: CreativeCard;
-  keyframe?: { sourceUrl: string; objectKey: string; size?: string; model?: string; cost: number };
+  imagePlan?: ImagePlan;
+  storyboardImages?: StoryboardImage[];
+  imageQuality?: QualityReport;
+  videoQuality?: QualityReport;
+  canvas?: CanvasPlan;
+  approvals?: {
+    creativeAt?: string;
+    imagePlanAt?: string;
+    canvasAt?: string;
+  };
   taskId?: string;
+  candidateVideoUrl?: string;
+  videoUsageTokens?: number;
   events?: PipelineActivityEvent[];
 };
 
@@ -140,13 +206,18 @@ export function pipelineInfo() {
 export async function submitPipeline(input: PipelineInput): Promise<PipelineSnapshot> {
   const info = pipelineInfo();
   if (info.mode === "demo") {
-    return { status: "ingesting", progress: 4, providerJobId: `mock_${input.projectId}` };
+    return {
+      status: "ingesting",
+      progress: 4,
+      providerJobId: `mock_${input.projectId}`,
+      state: withEvent({ phase: "ingesting", revision: 1, referenceIndex: 0, analyses: [] }, "prepare", "演示任务已创建，开始读取参考素材"),
+    };
   }
   return {
     status: "ingesting",
     progress: 4,
     providerJobId: `ark_${input.projectId}`,
-    state: withEvent({ phase: "ingesting", referenceIndex: 0, analyses: [] }, "prepare", "制作任务已创建，开始读取参考素材"),
+    state: withEvent({ phase: "ingesting", revision: 1, referenceIndex: 0, analyses: [] }, "prepare", "制作任务已创建，开始读取参考素材"),
   };
 }
 
@@ -159,7 +230,8 @@ export async function readPipeline(args: {
 }): Promise<PipelineSnapshot> {
   const info = pipelineInfo();
   if (info.mode === "demo" || !args.providerJobId || args.providerJobId.startsWith("mock_")) {
-    return demoSnapshot(args.createdAt);
+    if (!args.state) return failure("PipelineStateMissing", "演示制作状态缺失，请重新创建任务");
+    return advanceDemoPipeline(args.input, args.state);
   }
   if (!args.state) return failure("PipelineStateMissing", "真实制作状态缺失，请重新创建任务");
 
@@ -201,14 +273,7 @@ async function advanceArkPipeline(input: PipelineInput, state: ArkPipelineState,
       return nextReferenceState(input, state, analysis);
     }
 
-    const analysis = {
-      source_index: state.referenceIndex + 1,
-      source_name: String(reference.name ?? `参考 ${state.referenceIndex + 1}`),
-      access_note: "该分享链接不是可直接下载的视频地址，本轮仅使用用户标注与来源信息；上传原视频可获得完整画面和声音解析。",
-      emphasis: reference.emphasis ?? [],
-      priority: Boolean(reference.priority),
-    };
-    return nextReferenceState(input, state, analysis);
+    throw new Error(`参考 ${state.referenceIndex + 1} 没有取得可解析的视频文件，请上传原视频后重试`);
   }
 
   if (state.phase === "waiting_file") {
@@ -228,55 +293,160 @@ async function advanceArkPipeline(input: PipelineInput, state: ArkPipelineState,
   if (state.phase === "synthesizing") {
     const creative = await synthesizeCreative(input, state.analyses);
     return {
-      status: "generating_assets",
-      progress: 42,
-      state: withEvent({ ...state, phase: "generating_keyframe", creative, currentFileId: undefined }, "storyboard", `剧本与镜头计划已完成：${creative.theme || creative.concept || "原创短视频方案"}`),
+      status: "awaiting_review",
+      progress: 38,
+      state: withEvent({ ...state, revision: (state.revision ?? 1) + 1, phase: "awaiting_creative_review", creative, currentFileId: undefined }, "creative_review", `参考解析与融合创意已完成，等待你确认：${creative.theme || creative.concept || "原创短视频方案"}`, "success"),
     };
   }
 
-  if (state.phase === "generating_keyframe") {
-    const keyframe = await generateKeyframe(input, state.creative ?? {}, ownerId);
+  if (state.phase === "awaiting_creative_review" || state.phase === "awaiting_image_plan" || state.phase === "awaiting_canvas_review") {
     return {
-      status: "generating_assets",
-      progress: 57,
-      state: withEvent({ ...state, phase: "submitting_video", keyframe }, "keyframe", "Seedream 首帧关键视觉已生成并归档", "success"),
+      status: "awaiting_review",
+      progress: state.phase === "awaiting_creative_review" ? 38 : state.phase === "awaiting_image_plan" ? 48 : 72,
+      state,
+    };
+  }
+
+  if (state.phase === "planning_images") {
+    const imagePlan = await planStoryboardImages(input, state.creative ?? {}, state.analyses);
+    return {
+      status: "awaiting_review",
+      progress: 48,
+      state: withEvent({ ...state, revision: (state.revision ?? 1) + 1, phase: "awaiting_image_plan", imagePlan }, "image_plan_review", "4 张分镜图片提示词已规划，等待你逐张确认", "success"),
+    };
+  }
+
+  if (state.phase === "generating_images") {
+    if (!state.imagePlan) throw new Error("图片提示词方案缺失");
+    const storyboardImages = await generateStoryboardImages(input, state.creative ?? {}, state.imagePlan, ownerId, state.revision);
+    return {
+      status: "quality_checking",
+      progress: 68,
+      state: withEvent({ ...state, phase: "reviewing_images", storyboardImages }, "image_quality", "4张分镜图片已生成并归档，正在检查主题一致性、跨图连续性与禁项"),
+    };
+  }
+
+  if (state.phase === "reviewing_images") {
+    if (!state.imagePlan || !state.storyboardImages || state.storyboardImages.length !== 4) throw new Error("分镜图片质检输入不完整");
+    const imageQuality = await reviewStoryboardImages(input, state.creative ?? {}, state.imagePlan, state.storyboardImages);
+    if (!imageQuality.passed) throw new Error(`分镜图片质量检查未通过：${imageQuality.issues.join("；") || imageQuality.summary}`);
+    return {
+      status: "awaiting_review",
+      progress: 72,
+      state: withEvent({ ...state, revision: (state.revision ?? 1) + 1, phase: "awaiting_canvas_review", imageQuality }, "canvas_review", "4 张分镜图片已生成、质量复核通过并归档，等待你确认画布顺序与运动", "success"),
     };
   }
 
   if (state.phase === "submitting_video") {
-    const task = await createSeedanceTask(input, state.creative ?? {}, state.keyframe?.sourceUrl);
+    if (!state.imagePlan || !state.storyboardImages || !state.canvas) throw new Error("已确认的分镜画布不完整");
+    const task = await createSeedanceTask(input, state.creative ?? {}, state.imagePlan, state.storyboardImages, state.canvas);
     return {
       status: "generating_video",
-      progress: 64,
+      progress: 78,
       providerJobId: task.id,
-      state: withEvent({ ...state, phase: "polling_video", taskId: task.id }, "seedance_submit", "Seedance 2.0 任务已提交，正在等待生成资源"),
+      state: withEvent({ ...state, phase: "polling_video", taskId: task.id }, "seedance_submit", "已按确认画布绑定 4 张参考图，Seedance 2.0 任务已提交"),
+    };
+  }
+
+  if (state.phase === "reviewing_video") {
+    if (!state.candidateVideoUrl) throw new Error("待质检成片地址缺失");
+    const videoQuality = await reviewFinalVideo(input, state.creative ?? {}, state.imagePlan, state.canvas, state.candidateVideoUrl);
+    if (!videoQuality.passed) {
+      return failure("VideoQualityRejected", `成片质量检查未通过：${videoQuality.issues.join("；") || videoQuality.summary}`, { ...state, videoQuality });
+    }
+    const objectKey = await archiveVideo(input.projectId, ownerId, state.candidateVideoUrl);
+    const imageCost = (state.storyboardImages ?? []).reduce((total, image) => total + image.cost, 0);
+    const actualCost = state.videoUsageTokens ? Math.round(((state.videoUsageTokens * 46 / 1_000_000) + imageCost) * 10000) / 10000 : null;
+    return {
+      status: "completed",
+      progress: 100,
+      providerJobId: state.taskId,
+      state: withEvent({ ...state, videoQuality }, "delivery", "成片语义、约束、连续性与文件完整性检查通过并归档", "success"),
+      result: {
+        videoObjectKey: objectKey,
+        videoUrl: `/api/media/${encodeURIComponent(objectKey)}`,
+        qualityScore: Math.round((videoQuality.brief_alignment + videoQuality.visual_consistency + videoQuality.constraint_coverage) / 3 * 100),
+        actualCost,
+        concept: state.creative?.concept ?? state.creative?.theme,
+        hook: state.creative?.hook,
+      },
     };
   }
 
   if (!state.taskId) throw new Error("Seedance 任务标识缺失");
   const task = await arkRequest<ArkVideoTask>(`/contents/generations/tasks/${encodeURIComponent(state.taskId)}`);
-  if (task.status === "queued") return { status: "generating_video", progress: 68, providerJobId: task.id, state: withEvent(state, "seedance_queue", "Seedance 正在排队，任务状态正常") };
-  if (task.status === "running") return { status: "quality_checking", progress: 80, providerJobId: task.id, state: withEvent(state, "seedance_render", "Seedance 正在以关键帧为首帧渲染画面、动作与声音") };
+  if (task.status === "queued") return { status: "generating_video", progress: 82, providerJobId: task.id, state: withEvent(state, "seedance_queue", "Seedance 正在排队，任务状态正常") };
+  if (task.status === "running") return { status: "generating_video", progress: 92, providerJobId: task.id, state: withEvent(state, "seedance_render", "Seedance 正在按 4 张分镜与确认的运动画布渲染画面和声音") };
   if (task.status !== "succeeded" || !task.content?.video_url) {
     return failure(task.error?.code || `Seedance${task.status}`, task.error?.message || `视频生成任务状态：${task.status}`, state);
   }
 
-  const objectKey = await archiveVideo(input.projectId, ownerId, task.content.video_url);
-  const totalTokens = task.usage?.total_tokens ?? task.usage?.completion_tokens ?? 0;
-  const actualCost = totalTokens ? Math.round(((totalTokens * 46 / 1_000_000) + (state.keyframe?.cost ?? 0)) * 10000) / 10000 : null;
   return {
-    status: "completed",
-    progress: 100,
+    status: "quality_checking",
+    progress: 96,
     providerJobId: task.id,
-    state: withEvent(state, "delivery", "成片已生成、完整性校验通过并归档", "success"),
-    result: {
-      videoObjectKey: objectKey,
-      videoUrl: `/api/media/${encodeURIComponent(objectKey)}`,
-      qualityScore: 90,
-      actualCost,
-      concept: state.creative?.concept ?? state.creative?.theme,
-      hook: state.creative?.hook,
-    },
+    state: withEvent({ ...state, phase: "reviewing_video", candidateVideoUrl: task.content.video_url, videoUsageTokens: task.usage?.total_tokens ?? task.usage?.completion_tokens ?? 0 }, "video_quality", "Seedance 成片已返回，正在进行主题、约束、连续性与瑕疵硬质检"),
+  };
+}
+
+export function approvePipelineGate(args: {
+  state: ArkPipelineState;
+  gate: "creative" | "image_plan" | "canvas";
+  payload: unknown;
+}): PipelineSnapshot {
+  const { state, gate } = args;
+  const now = new Date().toISOString();
+
+  if (gate === "creative") {
+    if (state.phase !== "awaiting_creative_review") throw new Error("当前任务不在创意确认阶段");
+    const payload = objectValue(args.payload);
+    const analyses = Array.isArray(payload.analyses) ? payload.analyses.map((entry) => objectValue(entry)) : null;
+    if (!analyses || analyses.length !== state.analyses.length) throw new Error("参考解析数量与原素材不一致");
+    const creative = normalizeCreativeCard(payload.creative);
+    return {
+      status: "generating_assets",
+      progress: 40,
+      state: withEvent({
+        ...state,
+        revision: (state.revision ?? 1) + 1,
+        phase: "planning_images",
+        analyses,
+        creative,
+        approvals: { ...state.approvals, creativeAt: now },
+      }, "creative_approved", "你已确认参考解析与融合创意，开始规划 4 张分镜图片", "success"),
+    };
+  }
+
+  if (gate === "image_plan") {
+    if (state.phase !== "awaiting_image_plan") throw new Error("当前任务不在图片提示词确认阶段");
+    const imagePlan = normalizeImagePlan(args.payload);
+    return {
+      status: "generating_assets",
+      progress: 50,
+      state: withEvent({
+        ...state,
+        revision: (state.revision ?? 1) + 1,
+        phase: "generating_images",
+        imagePlan,
+        storyboardImages: undefined,
+        approvals: { ...state.approvals, imagePlanAt: now },
+      }, "image_plan_approved", "你已确认 4 张图片提示词，Seedream 开始生成连贯分镜", "success"),
+    };
+  }
+
+  if (state.phase !== "awaiting_canvas_review") throw new Error("当前任务不在画布确认阶段");
+  if (!state.imagePlan || !state.storyboardImages || state.storyboardImages.length !== 4) throw new Error("画布所需图片尚未准备完整");
+  const canvas = normalizeCanvasPlan(args.payload, state.imagePlan, state.storyboardImages);
+  return {
+    status: "generating_video",
+    progress: 74,
+    state: withEvent({
+      ...state,
+      revision: (state.revision ?? 1) + 1,
+      phase: "submitting_video",
+      canvas: { ...canvas, confirmedAt: now },
+      approvals: { ...state.approvals, canvasAt: now },
+    }, "canvas_approved", "你已确认分镜画布，开始编译并提交 Seedance 2.0", "success"),
   };
 }
 
@@ -287,6 +457,7 @@ function nextReferenceState(input: PipelineInput, state: ArkPipelineState, analy
     progress: nextIndex >= input.references.length ? 30 : referenceProgress(nextIndex, input.references.length),
     state: {
       phase: nextIndex >= input.references.length ? "synthesizing" : "ingesting",
+      revision: state.revision ?? 1,
       referenceIndex: nextIndex,
       analyses: [...state.analyses, analysis],
       events: withEvent(state, "reference_analysis", `参考 ${nextIndex} 的画面、节奏与创意机制解析完成`, "success").events,
@@ -346,8 +517,8 @@ async function analyzeReference(source: { fileId?: string; videoUrl?: string }, 
   const media = source.fileId
     ? { type: "input_video", file_id: source.fileId }
     : { type: "input_video", video_url: source.videoUrl };
-  const prompt = `你是短视频导演和广告创意分析师。分析这条参考视频，只提取可迁移的创意机制，禁止复刻人物、品牌、台词或受版权保护的表达。
-请只输出一个 JSON 对象，字段必须包括：summary、timeline_beats、hook、creative_mechanism、visual_grammar、camera_and_motion、pacing、audio_design、emotion_curve、reusable_techniques、seedance_prompt_fragments、quality_risks、confidence。
+  const prompt = `你是短视频导演和广告创意分析师。完整观看并分析这条参考视频，只记录画面或声音中有证据的内容，只提取可迁移的创意机制，禁止复刻人物、品牌、台词或受版权保护的表达。
+请只输出一个合法 JSON 对象，不要 Markdown。字段必须包括：summary（50-200字）、timeline_beats（数组）、hook、creative_mechanism、visual_grammar、camera_and_motion、pacing、audio_design、emotion_curve、reusable_techniques（数组）、seedance_prompt_fragments（数组）、quality_risks（数组）、confidence（0到1）。禁止根据标题或常识补写视频中没有出现的内容。
 参考序号：${index + 1}；用户标注重点：${JSON.stringify(reference.emphasis ?? [])}；是否重点参考：${Boolean(reference.priority)}。`;
   const response = await arkRequest<ArkResponse>("/responses", {
     method: "POST",
@@ -360,7 +531,7 @@ async function analyzeReference(source: { fileId?: string; videoUrl?: string }, 
     }),
   });
   const parsed = parseModelJson(responseText(response));
-  return { source_index: index + 1, source_name: reference.name, ...parsed };
+  return normalizeReferenceAnalysis(parsed, index, reference);
 }
 
 async function synthesizeCreative(input: PipelineInput, analyses: Array<Record<string, unknown>>): Promise<CreativeCard> {
@@ -378,11 +549,44 @@ async function synthesizeCreative(input: PipelineInput, analyses: Array<Record<s
       max_output_tokens: 2600,
     }),
   });
-  return parseModelJson(responseText(response)) as CreativeCard;
+  return normalizeCreativeCard(parseModelJson(responseText(response)));
 }
 
-async function generateKeyframe(input: PipelineInput, creative: CreativeCard, ownerId: string) {
-  const prompt = `为一条15秒竖屏短视频生成首帧关键视觉。画幅9:16，电影级真实摄影，主体清晰，环境完整，光线和色彩统一，构图为后续镜头运动预留空间。不要文字、字幕、品牌标识、边框或拼图。\n创意：${creative.concept || creative.theme || input.topic || input.goal}\n开场钩子：${creative.hook || "第一眼建立强视觉吸引力"}\n视觉风格：${creative.visual_style || input.style}\n首镜头计划：${JSON.stringify(creative.shot_plan?.[0] ?? {})}`;
+async function planStoryboardImages(input: PipelineInput, creative: CreativeCard, analyses: Array<Record<string, unknown>>): Promise<ImagePlan> {
+  const prompt = `你是电影分镜导演和 Seedream 图片提示词专家。根据已经由用户确认的参考解析和唯一创意，为15秒9:16短视频规划严格4张、角色与美术连续的关键分镜图。四张图必须共同覆盖开场钩子、发展、转折和收束，不得改变主题、产品、受众、风格或必备内容。用户确认后的文本优先级最高。
+用户简报：${JSON.stringify({ topic: input.topic, goal: input.goal, audience: input.audience, style: input.style, company: input.company, mustInclude: input.mustInclude, mustAvoid: input.mustAvoid, cta: input.cta })}
+用户确认后的参考解析：${JSON.stringify(analyses)}
+已确认创意：${JSON.stringify(creative)}
+只输出合法 JSON，不要 Markdown。格式：{"continuity_anchor":"每张图都必须复用的主体身份、服装、产品、场景基调、色彩与光线描述","frames":[{"order":1,"time_range":"0-3秒","title":"镜头标题","narrative_goal":"该画面在故事中的作用","prompt":"可直接用于生成单张9:16高质量分镜图的完整中文提示词，严格遵循已确认视觉风格，写清主体、动作、环境、构图、镜头、光线；禁止无关文字、水印和拼图","motion":"后续视频中该画面的主体动作与运镜"}]}。frames 必须恰好4项，order必须为1到4，时间段必须连续覆盖0到15秒。`;
+  const response = await arkRequest<ArkResponse>("/responses", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      model: arkConfig().reviewModel,
+      input: prompt,
+      max_output_tokens: 2800,
+    }),
+  });
+  return normalizeImagePlan(parseModelJson(responseText(response)));
+}
+
+async function generateStoryboardImages(
+  input: PipelineInput,
+  creative: CreativeCard,
+  imagePlan: ImagePlan,
+  ownerId: string,
+  revision: number,
+) {
+  const frameLines = imagePlan.frames.map((frame) => `图${frame.order}（${frame.time_range}，${frame.title}）：${frame.prompt}`).join("\n");
+  const brandVisualRequired = Boolean(input.company?.trim()) || /品牌|包装|logo|标识|文字/i.test(input.mustInclude ?? "");
+  const textPolicy = brandVisualRequired
+    ? `如画面包含已授权品牌“${input.company || "用户指定品牌"}”或产品包装，只能准确保持用户要求的外观与标识，不得杜撰其他品牌或文字`
+    : "禁止任何文字、字幕、logo和水印";
+  const prompt = `生成严格4张彼此独立的9:16竖屏高质量分镜组图，按顺序输出，不要拼成一张图。四张图属于同一条15秒短视频，必须保持同一主体身份、面部或产品外观、服装、核心场景、美术风格、色彩和光线连续。整体视觉风格严格遵循：${creative.visual_style || input.style}。
+连续性圣经：${imagePlan.continuity_anchor}
+创意主句：${creative.concept || creative.theme || input.topic || input.goal}
+${frameLines}
+全局规则：${textPolicy}；禁止边框、分屏、拼贴；禁止出现“${input.mustAvoid || "畸形手部、重复肢体、模糊主体"}”。每张都是单一完整画面，并为对应运镜预留空间。`;
   const response = await arkRequest<ArkImageResponse>("/images/generations", {
     method: "POST",
     headers: { "content-type": "application/json" },
@@ -390,21 +594,100 @@ async function generateKeyframe(input: PipelineInput, creative: CreativeCard, ow
       model: arkConfig().imageModel,
       prompt,
       size: "1440x2560",
-      sequential_image_generation: "disabled",
+      sequential_image_generation: "auto",
+      sequential_image_generation_options: { max_images: 4 },
       response_format: "url",
       watermark: false,
     }),
   });
-  const sourceUrl = response.data?.[0]?.url;
-  if (!sourceUrl) throw new Error("Seedream 未返回可用的关键帧图片");
-  const objectKey = await archiveImage(input.projectId, ownerId, sourceUrl);
-  return { sourceUrl, objectKey, size: response.data?.[0]?.size, model: response.model ?? arkConfig().imageModel, cost: 0.22 };
+  const outputs = (response.data ?? []).filter((item): item is { url: string; size?: string } => Boolean(item.url));
+  if (outputs.length !== 4) throw new Error(`Seedream 应返回4张分镜图，实际返回${outputs.length}张，任务已停止`);
+  return Promise.all(outputs.map(async (output, index) => ({
+    frameId: imagePlan.frames[index].id,
+    order: index + 1,
+    sourceUrl: output.url,
+    objectKey: await archiveImage(input.projectId, ownerId, output.url, revision, index + 1),
+    size: output.size,
+    model: response.model ?? arkConfig().imageModel,
+    cost: 0.22,
+    generatedAt: new Date().toISOString(),
+  })));
 }
 
-async function createSeedanceTask(input: PipelineInput, creative: CreativeCard, keyframeUrl?: string) {
-  const prompt = creative.seedance_prompt || `${creative.hook || "强视觉钩子"}。${creative.concept || input.topic || input.goal}。${creative.visual_style || input.style}。15秒，9:16竖屏，主体一致，镜头运动自然，画面真实清晰。`;
+async function reviewStoryboardImages(input: PipelineInput, creative: CreativeCard, imagePlan: ImagePlan, images: StoryboardImage[]) {
+  const media = [...images].sort((a, b) => a.order - b.order).map((image) => ({ type: "input_image", image_url: image.sourceUrl }));
+  const prompt = `你是严格的短视频分镜质检导演。逐张检查这4张真实生成图片是否与已确认创意和各自提示词一致，并检查跨图主体/产品/服装/场景/风格连续性、畸形肢体、无关人物、乱码、未授权Logo、用户必备与禁用内容。任何一张明显偏题、连续性崩坏或命中禁项，都必须判定不通过。
+用户简报：${JSON.stringify({ topic: input.topic, goal: input.goal, audience: input.audience, company: input.company, mustInclude: input.mustInclude, mustAvoid: input.mustAvoid, style: input.style })}
+已确认创意：${JSON.stringify(creative)}
+已确认图片方案：${JSON.stringify(imagePlan)}
+只输出合法JSON：{"passed":true,"brief_alignment":0.0,"visual_consistency":0.0,"constraint_coverage":0.0,"issues":[],"summary":"结论"}。三个分数范围0到1；只有全部分数不低于0.78且没有硬问题时 passed 才能为 true。`;
+  const response = await arkRequest<ArkResponse>("/responses", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      model: arkConfig().analysisModel,
+      input: [{ type: "message", role: "user", content: [...media, { type: "input_text", text: prompt }] }],
+      max_output_tokens: 1200,
+      thinking: { type: "disabled" },
+    }),
+  });
+  return normalizeQualityReport(parseModelJson(responseText(response)), 0.78);
+}
+
+async function reviewFinalVideo(
+  input: PipelineInput,
+  creative: CreativeCard,
+  imagePlan: ImagePlan | undefined,
+  canvas: CanvasPlan | undefined,
+  videoUrl: string,
+) {
+  const prompt = `你是成片交付质量总监。完整观看这条15秒视频，逐项核对用户简报、人工确认创意、4图方案和运动画布。重点检查：主题是否跑偏、必须内容是否覆盖、禁项是否出现、主体/产品是否连续、动作是否符合物理、转场是否按顺序、画面是否有畸形/乱码/黑帧、声音是否与情绪和动作匹配。只要明显偏题、命中禁项或主体严重漂移，必须判定不通过。
+用户简报：${JSON.stringify({ topic: input.topic, goal: input.goal, audience: input.audience, company: input.company, mustInclude: input.mustInclude, mustAvoid: input.mustAvoid, cta: input.cta, style: input.style })}
+已确认创意：${JSON.stringify(creative)}
+已确认图片方案：${JSON.stringify(imagePlan)}
+已确认画布：${JSON.stringify(canvas)}
+只输出合法JSON：{"passed":true,"brief_alignment":0.0,"visual_consistency":0.0,"constraint_coverage":0.0,"issues":[],"summary":"结论"}。三个分数范围0到1；只有全部分数不低于0.8且没有硬问题时 passed 才能为 true。`;
+  const response = await arkRequest<ArkResponse>("/responses", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      model: arkConfig().analysisModel,
+      input: [{ type: "message", role: "user", content: [{ type: "input_video", video_url: videoUrl }, { type: "input_text", text: prompt }] }],
+      max_output_tokens: 1400,
+      thinking: { type: "disabled" },
+    }),
+  });
+  return normalizeQualityReport(parseModelJson(responseText(response)), 0.8);
+}
+
+async function createSeedanceTask(
+  input: PipelineInput,
+  creative: CreativeCard,
+  imagePlan: ImagePlan,
+  storyboardImages: StoryboardImage[],
+  canvas: CanvasPlan,
+) {
+  const orderedFrames = [...canvas.frames].sort((a, b) => a.order - b.order);
+  const orderedImages = orderedFrames.map((frame) => {
+    const image = storyboardImages.find((entry) => entry.frameId === frame.frameId);
+    if (!image) throw new Error(`画布镜头 ${frame.order} 缺少已归档图片`);
+    return image;
+  });
+  const oldestGeneratedAt = Math.min(...orderedImages.map((image) => new Date(image.generatedAt).getTime()));
+  if (!Number.isFinite(oldestGeneratedAt) || Date.now() - oldestGeneratedAt > 23 * 60 * 60 * 1000) {
+    throw new Error("分镜图片的供应商临时地址已超过安全有效期。为避免无效生成，任务已停止，请重新生成图片后再提交视频");
+  }
+  const timeline = orderedFrames.map((canvasFrame, index) => {
+    const planFrame = imagePlan.frames.find((frame) => frame.id === canvasFrame.frameId);
+    const transition = canvas.transitions.find((entry) => entry.fromFrameId === canvasFrame.frameId);
+    return `${planFrame?.time_range || `镜头${index + 1}`}：@图片${index + 1}，${clipText(planFrame?.narrative_goal || planFrame?.title || "推进故事", 100)}；${clipText(canvasFrame.motion, 120)}${transition ? `；${clipText(transition.description, 80)}` : ""}`;
+  }).join("。\n");
+  const shotDirections = (creative.shot_plan ?? []).map((shot, index) => `镜头${index + 1}:${clipText(shot.user_direction ?? shot.description ?? shot.action ?? shot, 80)}`).join("；");
+  const prompt = clipText(`15秒，9:16竖屏，视觉风格严格遵循“${clipText(creative.visual_style || input.style, 100)}”。主题“${clipText(creative.theme || input.topic || input.goal, 100)}”；创意：${clipText(creative.concept || input.goal, 180)}；结构：${clipText(creative.story_arc || "钩子、发展、转折、收束", 220)}；前2秒：${clipText(creative.hook || "用明确动作建立视觉吸引", 120)}。附件4张图片按@图片1到@图片4的顺序对应四段画面，保持主体身份、产品外观、服装、场景、色彩和光线连续，不新增无关人物、产品或地点。
+${timeline}
+镜头确认稿：${shotDirections || "按上述四段执行"}。声音：${clipText(creative.audio_plan || "环境声与动作同步", 120)}。客户/产品：${clipText(input.company || "无指定", 80)}。必须出现：${clipText(input.mustInclude || "已确认创意中的核心内容", 180)}。禁止出现：${clipText(input.mustAvoid || "乱码、水印、畸形肢体、主体漂移", 180)}。结尾表达：${clipText(input.cta || "按创意自然收束", 120)}。动作符合物理规律。`, 1800);
   const content: Array<Record<string, unknown>> = [{ type: "text", text: prompt }];
-  if (keyframeUrl) content.push({ type: "image_url", image_url: { url: keyframeUrl }, role: "first_frame" });
+  orderedImages.forEach((image) => content.push({ type: "image_url", image_url: { url: image.sourceUrl }, role: "reference_image" }));
   return arkRequest<{ id: string }>("/contents/generations/tasks", {
     method: "POST",
     headers: { "content-type": "application/json" },
@@ -412,7 +695,7 @@ async function createSeedanceTask(input: PipelineInput, creative: CreativeCard, 
       model: arkConfig().videoModel,
       content,
       resolution: "1080p",
-      ratio: keyframeUrl ? "adaptive" : "9:16",
+      ratio: "9:16",
       duration: 15,
       generate_audio: true,
       return_last_frame: true,
@@ -423,17 +706,17 @@ async function createSeedanceTask(input: PipelineInput, creative: CreativeCard, 
   });
 }
 
-async function archiveImage(projectId: string, ownerId: string, imageUrl: string) {
+async function archiveImage(projectId: string, ownerId: string, imageUrl: string, revision: number, index: number) {
   const storage = bindings().MEDIA;
   if (!storage) throw new Error("对象存储不可用");
   const response = await fetch(imageUrl);
   if (!response.ok || !response.body) throw new Error(`关键帧下载失败（${response.status}）`);
   const contentType = response.headers.get("content-type") || "image/jpeg";
   const extension = contentType.includes("png") ? "png" : contentType.includes("webp") ? "webp" : "jpg";
-  const key = `outputs/${ownerId}/${projectId}/keyframe.${extension}`;
-  await storage.put(key, response.body, { httpMetadata: { contentType }, customMetadata: { projectId, source: "seedream-5.0-lite" } });
+  const key = `outputs/${ownerId}/${projectId}/storyboard/r${revision}/frame-${String(index).padStart(2, "0")}.${extension}`;
+  await storage.put(key, response.body, { httpMetadata: { contentType }, customMetadata: { projectId, source: "seedream-5.0-lite", frame: String(index), revision: String(revision) } });
   const head = await storage.head(key);
-  if (!head || head.size <= 0) throw new Error("关键帧归档校验失败");
+  if (!head || head.size <= 0) throw new Error(`分镜图 ${index} 归档校验失败`);
   return key;
 }
 
@@ -471,6 +754,155 @@ function responseText(response: ArkResponse) {
     .join("\n");
 }
 
+function objectValue(value: unknown): Record<string, unknown> {
+  if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("确认内容格式无效");
+  return value as Record<string, unknown>;
+}
+
+function textValue(value: unknown, field: string, max = 6000) {
+  const text = typeof value === "string" ? value.trim() : value == null ? "" : JSON.stringify(value);
+  if (!text) throw new Error(`${field}不能为空`);
+  if (text.length > max) throw new Error(`${field}内容过长`);
+  return text;
+}
+
+function optionalText(value: unknown, max = 6000) {
+  if (value == null || value === "") return undefined;
+  const text = typeof value === "string" ? value.trim() : JSON.stringify(value);
+  if (text.length > max) throw new Error("确认内容过长");
+  return text || undefined;
+}
+
+function textList(value: unknown) {
+  if (!Array.isArray(value)) return value == null || value === "" ? [] : [textValue(value, "列表项", 1200)];
+  return value.slice(0, 30).map((item) => textValue(item, "列表项", 1200));
+}
+
+function normalizeReferenceAnalysis(value: unknown, index: number, reference: Record<string, unknown>) {
+  const source = objectValue(value);
+  const confidence = Number(source.confidence);
+  return {
+    source_index: index + 1,
+    source_name: String(reference.name ?? `参考 ${index + 1}`),
+    summary: textValue(source.summary, "视频摘要", 2000),
+    timeline_beats: Array.isArray(source.timeline_beats) ? source.timeline_beats.slice(0, 20) : [],
+    hook: textValue(source.hook, "开场钩子", 1200),
+    creative_mechanism: textValue(source.creative_mechanism, "创意机制", 2000),
+    visual_grammar: textValue(source.visual_grammar, "视觉语言", 2000),
+    camera_and_motion: textValue(source.camera_and_motion, "镜头运动", 2000),
+    pacing: textValue(source.pacing, "节奏", 1200),
+    audio_design: textValue(source.audio_design, "声音设计", 1200),
+    emotion_curve: textValue(source.emotion_curve, "情绪曲线", 1200),
+    reusable_techniques: textList(source.reusable_techniques),
+    seedance_prompt_fragments: textList(source.seedance_prompt_fragments),
+    quality_risks: textList(source.quality_risks),
+    confidence: Number.isFinite(confidence) ? Math.max(0, Math.min(1, confidence)) : 0.5,
+    emphasis: reference.emphasis ?? [],
+    priority: Boolean(reference.priority),
+  };
+}
+
+function normalizeCreativeCard(value: unknown): CreativeCard {
+  const source = objectValue(value);
+  const shotPlan = Array.isArray(source.shot_plan) ? source.shot_plan.slice(0, 12).map((item) => typeof item === "string" ? { description: item } : objectValue(item)) : [];
+  if (shotPlan.length < 3) throw new Error("融合创意至少需要3个可执行镜头");
+  return {
+    theme: textValue(source.theme, "创意主题", 300),
+    concept: textValue(source.concept, "一句话创意", 1200),
+    hook: textValue(source.hook, "前2秒钩子", 600),
+    story_arc: textValue(source.story_arc, "故事结构", 2400),
+    shot_plan: shotPlan,
+    visual_style: textValue(source.visual_style, "视觉风格", 1200),
+    audio_plan: textValue(source.audio_plan, "声音方案", 1200),
+    seedance_prompt: optionalText(source.seedance_prompt, 6000),
+    quality_risks: textList(source.quality_risks),
+  };
+}
+
+function normalizeImagePlan(value: unknown): ImagePlan {
+  const source = objectValue(value);
+  const rawFrames = source.frames;
+  if (!Array.isArray(rawFrames) || rawFrames.length !== 4) throw new Error("图片方案必须恰好包含4张分镜");
+  const frames = rawFrames.map((item, index) => {
+    const frame = objectValue(item);
+    const order = Number(frame.order);
+    if (order !== index + 1) throw new Error("图片方案顺序必须为1到4且不能重复");
+    return {
+      id: `frame_${index + 1}`,
+      order,
+      time_range: textValue(frame.time_range, `第${order}张时间段`, 80),
+      title: textValue(frame.title, `第${order}张标题`, 160),
+      narrative_goal: textValue(frame.narrative_goal, `第${order}张叙事作用`, 600),
+      prompt: textValue(frame.prompt, `第${order}张图片提示词`, 3600),
+      motion: textValue(frame.motion, `第${order}张运动说明`, 1000),
+    };
+  });
+  const ranges = frames.map((frame) => parseTimeRange(frame.time_range));
+  if (ranges.some((range) => !range) || ranges[0]?.[0] !== 0 || ranges.at(-1)?.[1] !== 15) throw new Error("4张分镜的时间段必须连续覆盖0到15秒");
+  for (let index = 1; index < ranges.length; index += 1) {
+    if (!ranges[index - 1] || !ranges[index] || ranges[index - 1]![1] !== ranges[index]![0]) throw new Error("4张分镜的时间段不能重叠或留空");
+  }
+  return { continuity_anchor: textValue(source.continuity_anchor, "连续性设定", 2400), frames };
+}
+
+function normalizeCanvasPlan(value: unknown, imagePlan: ImagePlan, storyboardImages: StoryboardImage[]): CanvasPlan {
+  const source = objectValue(value);
+  if (!Array.isArray(source.frames) || source.frames.length !== 4) throw new Error("画布必须包含4个图片节点");
+  const available = new Set(storyboardImages.map((image) => image.frameId));
+  const frames = source.frames.map((item, index) => {
+    const frame = objectValue(item);
+    const frameId = textValue(frame.frameId, "画布图片标识", 80);
+    if (!available.has(frameId) || !imagePlan.frames.some((planFrame) => planFrame.id === frameId)) throw new Error("画布包含无效图片");
+    if (frameId !== imagePlan.frames[index].id) throw new Error("MVP画布必须保持已确认的时间轴顺序");
+    if (Number(frame.order) !== index + 1) throw new Error("画布顺序必须连续且不能重复");
+    return { frameId, order: index + 1, motion: textValue(frame.motion, `镜头${index + 1}运动`, 1000) };
+  });
+  if (new Set(frames.map((frame) => frame.frameId)).size !== 4) throw new Error("画布不能重复使用同一张图片");
+  if (!Array.isArray(source.transitions) || source.transitions.length !== 3) throw new Error("4张图片之间必须设置3个转场");
+  const transitions = source.transitions.map((item, index) => {
+    const transition = objectValue(item);
+    const expectedFrom = frames[index].frameId;
+    const expectedTo = frames[index + 1].frameId;
+    if (transition.fromFrameId !== expectedFrom || transition.toFrameId !== expectedTo) throw new Error("转场连接与画布顺序不一致");
+    return { fromFrameId: expectedFrom, toFrameId: expectedTo, description: textValue(transition.description, `转场${index + 1}`, 600) };
+  });
+  return { frames, transitions };
+}
+
+function normalizeQualityReport(value: unknown, threshold: number): QualityReport {
+  const source = objectValue(value);
+  const score = (entry: unknown) => {
+    const parsed = Number(entry);
+    if (!Number.isFinite(parsed)) throw new Error("质量检查没有返回有效分数");
+    return Math.max(0, Math.min(1, parsed));
+  };
+  const briefAlignment = score(source.brief_alignment);
+  const visualConsistency = score(source.visual_consistency);
+  const constraintCoverage = score(source.constraint_coverage);
+  const issues = textList(source.issues);
+  return {
+    passed: source.passed === true && issues.length === 0 && briefAlignment >= threshold && visualConsistency >= threshold && constraintCoverage >= threshold,
+    brief_alignment: briefAlignment,
+    visual_consistency: visualConsistency,
+    constraint_coverage: constraintCoverage,
+    issues,
+    summary: textValue(source.summary, "质量检查结论", 1200),
+  };
+}
+
+function parseTimeRange(value: string): [number, number] | null {
+  const match = value.match(/(\d+(?:\.\d+)?)\D+(\d+(?:\.\d+)?)/);
+  if (!match) return null;
+  const start = Number(match[1]);
+  const end = Number(match[2]);
+  return Number.isFinite(start) && Number.isFinite(end) && start < end ? [start, end] : null;
+}
+
+function clipText(value: unknown, max: number) {
+  const text = typeof value === "string" ? value.trim() : value == null ? "" : JSON.stringify(value);
+  return text.length <= max ? text : `${text.slice(0, Math.max(0, max - 1))}…`;
+}
+
 function parseModelJson(text: string): Record<string, unknown> {
   const cleaned = text.trim().replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/, "");
   try { return JSON.parse(cleaned) as Record<string, unknown>; } catch {
@@ -479,12 +911,25 @@ function parseModelJson(text: string): Record<string, unknown> {
     if (start >= 0 && end > start) {
       try { return JSON.parse(cleaned.slice(start, end + 1)) as Record<string, unknown>; } catch { /* fall through */ }
     }
-    return { summary: cleaned };
+    throw new Error("模型未返回合法的结构化结果，任务已停止，请重新输入后重试");
   }
 }
 
 function failure(code: string, message: string, state?: ArkPipelineState): PipelineSnapshot {
-  const progressByPhase: Record<ArkPipelineState["phase"], number> = { ingesting: 12, waiting_file: 18, synthesizing: 38, generating_keyframe: 48, submitting_video: 60, polling_video: 74 };
+  const progressByPhase: Record<ArkPipelineState["phase"], number> = {
+    ingesting: 12,
+    waiting_file: 18,
+    synthesizing: 34,
+    awaiting_creative_review: 38,
+    planning_images: 44,
+    awaiting_image_plan: 48,
+    generating_images: 60,
+    reviewing_images: 68,
+    awaiting_canvas_review: 72,
+    submitting_video: 76,
+    polling_video: 88,
+    reviewing_video: 96,
+  };
   return { status: "failed", progress: state ? progressByPhase[state.phase] : 0, state: state ? withEvent(state, "failed", `任务中断：${message}`, "error") : state, error: { code, message } };
 }
 
@@ -502,34 +947,72 @@ function withEvent(state: ArkPipelineState, phase: string, message: string, leve
   };
 }
 
-function demoSnapshot(createdAt: string): PipelineSnapshot {
-  const elapsed = Math.max(0, Date.now() - new Date(createdAt).getTime());
-  const timeline: Array<{ until: number; status: PipelineStatus; from: number; to: number }> = [
-    { until: 3_500, status: "ingesting", from: 4, to: 15 },
-    { until: 7_000, status: "analyzing", from: 15, to: 30 },
-    { until: 10_500, status: "generating_assets", from: 30, to: 45 },
-    { until: 16_000, status: "generating_video", from: 45, to: 73 },
-    { until: 20_000, status: "quality_checking", from: 73, to: 87 },
-    { until: 23_500, status: "post_processing", from: 87, to: 96 },
-    { until: 25_000, status: "final_checking", from: 96, to: 99 },
-  ];
-  let previous = 0;
-  for (const item of timeline) {
-    if (elapsed < item.until) {
-      const ratio = Math.max(0, Math.min(1, (elapsed - previous) / (item.until - previous)));
-      return { status: item.status, progress: Math.round(item.from + (item.to - item.from) * ratio), providerJobId: null };
+function advanceDemoPipeline(input: PipelineInput, state: ArkPipelineState): PipelineSnapshot {
+  if (state.phase === "ingesting") {
+    if (state.referenceIndex >= input.references.length) {
+      return { status: "analyzing", progress: 32, state: withEvent({ ...state, phase: "synthesizing" }, "creative", "示例参考解析完成，开始融合创意") };
     }
-    previous = item.until;
+    const reference = input.references[state.referenceIndex];
+    const analysis = {
+      source_index: state.referenceIndex + 1,
+      source_name: String(reference.name ?? `参考 ${state.referenceIndex + 1}`),
+      summary: "示例素材以生活化动作、快速建立情境和清晰产品特写构成短视频节奏。",
+      timeline_beats: ["开场动作钩子", "生活场景发展", "产品成为转折", "情绪收束"],
+      hook: "用一个反常或利落动作在前2秒建立注意力",
+      creative_mechanism: "把日常压力与可感知的体验变化并置",
+      visual_grammar: "真实摄影、近景细节与环境中景交替",
+      camera_and_motion: "轻推镜配合动作匹配切换",
+      pacing: "快开场、稳发展、短收束",
+      audio_design: "环境声先行，音乐在转折处进入",
+      emotion_curve: "紧张到舒展",
+      reusable_techniques: ["动作钩子", "细节特写", "情绪反差"],
+      seedance_prompt_fragments: ["主体连续", "动作自然", "光线统一"],
+      quality_risks: ["避免照搬参考台词和品牌"],
+      confidence: 0.86,
+    };
+    return nextReferenceState(input, state, analysis);
+  }
+  if (state.phase === "synthesizing") {
+    const creative: CreativeCard = {
+      theme: input.topic || "把日常重新调回自己的节奏",
+      concept: "用一个被时间追赶的瞬间切入，让产品自然成为生活重新顺畅的转折点。",
+      hook: "前2秒用突然停住的动作和近景声音抓住注意力",
+      story_arc: "压力开场 → 体验产品 → 节奏舒展 → 情绪与行动号召收束",
+      shot_plan: [{ shot: 1 }, { shot: 2 }, { shot: 3 }, { shot: 4 }],
+      visual_style: input.style,
+      audio_plan: "真实环境声配合克制节奏音乐",
+      seedance_prompt: "",
+      quality_risks: ["主体和产品外观需跨镜头一致"],
+    };
+    return { status: "awaiting_review", progress: 38, state: withEvent({ ...state, revision: (state.revision ?? 1) + 1, phase: "awaiting_creative_review", creative }, "creative_review", "示例解析与融合创意已完成，等待确认", "success") };
+  }
+  if (state.phase === "planning_images") {
+    const imagePlan: ImagePlan = {
+      continuity_anchor: "同一位都市青年、米白上衣、暖灰室内、清晨侧光、真实电影摄影",
+      frames: [
+        { id: "frame_1", order: 1, time_range: "0-3秒", title: "动作钩子", narrative_goal: "建立压力与好奇", prompt: "都市青年在清晨桌前突然停住动作，近景，真实电影摄影，暖灰侧光，9:16，无文字", motion: "快速推近后短暂停顿" },
+        { id: "frame_2", order: 2, time_range: "3-7秒", title: "体验转折", narrative_goal: "让产品进入情境", prompt: "同一青年自然拿起产品开始使用，中近景，环境和服装保持一致，9:16，无文字", motion: "跟随手部动作平滑横移" },
+        { id: "frame_3", order: 3, time_range: "7-11秒", title: "感受展开", narrative_goal: "呈现体验变化", prompt: "同一青年神情舒展，生活空间更有呼吸感，中景，晨光增强，9:16，无文字", motion: "缓慢拉远展示环境" },
+        { id: "frame_4", order: 4, time_range: "11-15秒", title: "情绪收束", narrative_goal: "留下记忆与行动感", prompt: "同一青年带着产品走向明亮窗边，背影与侧脸，克制高级，9:16，无文字", motion: "轻微跟拍并稳定停住" },
+      ],
+    };
+    return { status: "awaiting_review", progress: 48, state: withEvent({ ...state, revision: (state.revision ?? 1) + 1, phase: "awaiting_image_plan", imagePlan }, "image_plan_review", "示例图片提示词已规划，等待确认", "success") };
+  }
+  if (state.phase === "generating_images") {
+    const storyboardImages = (state.imagePlan?.frames ?? []).map((frame) => ({ frameId: frame.id, order: frame.order, sourceUrl: "", objectKey: "", model: "Demo Storyboard", size: "1440x2560", cost: 0, generatedAt: new Date().toISOString() }));
+    return { status: "awaiting_review", progress: 72, state: withEvent({ ...state, revision: (state.revision ?? 1) + 1, phase: "awaiting_canvas_review", storyboardImages }, "canvas_review", "示例分镜已准备，等待确认画布", "success") };
+  }
+  if (["awaiting_creative_review", "awaiting_image_plan", "awaiting_canvas_review"].includes(state.phase)) {
+    return { status: "awaiting_review", progress: state.phase === "awaiting_creative_review" ? 38 : state.phase === "awaiting_image_plan" ? 48 : 72, state };
+  }
+  if (state.phase === "submitting_video") {
+    return { status: "generating_video", progress: 84, providerJobId: "mock_video", state: withEvent({ ...state, phase: "polling_video", taskId: "mock_video" }, "seedance_submit", "示例画布已提交", "success") };
   }
   return {
     status: "completed",
     progress: 100,
-    providerJobId: null,
-    result: {
-      qualityScore: 91,
-      actualCost: 0,
-      concept: "从被时间追赶的都市早晨切入，让产品成为找回个人节奏的自然动作。",
-      hook: "前 2 秒：你不是没时间，只是还没找到自己的节奏。",
-    },
+    providerJobId: "mock_video",
+    state: withEvent(state, "delivery", "示例流程已完成", "success"),
+    result: { qualityScore: 91, actualCost: 0, concept: state.creative?.concept, hook: state.creative?.hook },
   };
 }

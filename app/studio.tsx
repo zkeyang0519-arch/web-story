@@ -42,9 +42,11 @@ type Project = {
   progress: number;
   runMode: "demo" | "production";
   pipelinePhase?: string | null;
+  reviewRevision?: number | null;
   keyframeUrl?: string | null;
   keyframeModel?: string | null;
   keyframeSize?: string | null;
+  storyboardImages?: Array<{ frameId: string; order: number; url?: string | null; model?: string | null; size?: string | null }>;
   activity?: ActivityEvent[];
   error?: { code?: string; message?: string } | null;
   createdAt: string;
@@ -83,11 +85,12 @@ const processSteps = [
   { key: "receive", label: "接收并校验参考素材", detail: "确认文件、链接与素材权限", end: 6 },
   { key: "preprocess", label: "方舟文件预处理", detail: "上传并准备画面与声音轨道", end: 18 },
   { key: "understand", label: "逐条视频内容解析", detail: "提取高光、节奏与创意机制", end: 30 },
-  { key: "creative", label: "创意融合与剧本生成", detail: "收敛唯一创意和15秒剧本", end: 42 },
-  { key: "keyframe", label: "Seedream 首帧生成", detail: "生成并归档9:16关键视觉", end: 57 },
-  { key: "prompt", label: "图生视频提示词装配", detail: "绑定首帧和动作时间轴", end: 64 },
-  { key: "submit", label: "提交 Seedance 2.0", detail: "以关键帧为首帧创建视频任务", end: 69 },
-  { key: "render", label: "渲染画面、动作与声音", detail: "实时查询 Seedance 任务状态", end: 92 },
+  { key: "creative", label: "创意融合与人工确认", detail: "确认解析、唯一创意和15秒剧本", end: 40 },
+  { key: "image_plan", label: "4张图片提示词确认", detail: "先审提示词，再允许生成图片", end: 50 },
+  { key: "storyboard", label: "Seedream 连贯分镜生成", detail: "生成并归档4张9:16关键画面", end: 72 },
+  { key: "canvas", label: "画布连接与人工确认", detail: "锁定顺序、动作与3个转场", end: 74 },
+  { key: "submit", label: "提交 Seedance 2.0", detail: "绑定4张参考图和确认时间轴", end: 82 },
+  { key: "render", label: "渲染画面、动作与声音", detail: "实时查询 Seedance 任务状态", end: 96 },
   { key: "deliver", label: "质量校验、归档与交付", detail: "下载成片并校验文件完整性", end: 101 },
 ] as const;
 
@@ -137,15 +140,23 @@ function statusCopy(status: string) {
   const copy: Record<string, { eyebrow: string; title: string; detail: string }> = {
     ingesting: { eyebrow: "正在建立素材语境", title: "先看懂参考，再开始创作", detail: "提取节奏、画面语言与创意钩子，过滤水印、片尾和无效片段。" },
     analyzing: { eyebrow: "创意中枢工作中", title: "比较创意，并收敛成一个方向", detail: "Seed 视觉解析与高质量复核模型会提取、比较并融合创意，只把最终结论交给生成环节。" },
-    generating_assets: { eyebrow: "Seedream 关键帧生成中", title: "正在把剧本变成首帧画面", detail: "生成9:16关键视觉并归档，完成后作为 Seedance 图生视频的首帧。" },
+    generating_assets: { eyebrow: "视觉分镜准备中", title: "正在把确认的创意变成四张画面", detail: "先规划提示词，再生成角色与美术连续的9:16分镜组图。" },
     generating_video: { eyebrow: "Seedance 2.0 生成中", title: "镜头正在逐条进入监看台", detail: "高风险镜头会生成备选版本，系统自动保留质量更高的一条。" },
-    quality_checking: { eyebrow: "质量门检查中", title: "发现问题会只重做局部镜头", detail: "检查主体一致性、运动合理性、文字、节奏与画面瑕疵。" },
+    quality_checking: { eyebrow: "质量门检查中", title: "正在核对主题、连续性与禁项", detail: "检查主体一致性、动作、文字、节奏和用户约束；不通过会立即停止，不交付偏题成片。" },
     post_processing: { eyebrow: "最后装配", title: "正在完成声音、字幕与节奏", detail: "配音、环境声、版权安全音乐和字幕统一完成后进入终检。" },
     final_checking: { eyebrow: "最终检查", title: "离交付只差最后一道门", detail: "验证成片规格、音画同步、黑帧与文件完整性。" },
+    awaiting_review: { eyebrow: "等待你的确认", title: "制作已安全暂停", detail: "请检查当前内容；只有你确认后，系统才会继续调用下游模型。" },
     failed: { eyebrow: "任务已停止", title: "制作过程遇到错误", detail: "后续步骤已经停止，请查看右侧实时输出和错误说明。" },
     cancelled: { eyebrow: "任务已结束", title: "这次制作已被取消", detail: "系统不会继续调用模型或生成视频。" },
   };
   return copy[status] ?? copy.ingesting;
+}
+
+function reviewRoute(project: Project) {
+  if (project.pipelinePhase === "awaiting_creative_review") return `/projects/${project.id}/creative-review`;
+  if (["awaiting_image_plan", "generating_images", "reviewing_images"].includes(project.pipelinePhase ?? "")) return `/projects/${project.id}/image-plan`;
+  if (project.pipelinePhase === "awaiting_canvas_review") return `/projects/${project.id}/canvas`;
+  return null;
 }
 
 export function Studio({ view = "references", projectId }: { view?: StudioView; projectId?: string }) {
@@ -245,6 +256,10 @@ export function Studio({ view = "references", projectId }: { view?: StudioView; 
           const draftRoute = loaded.draftStep === "requirements" ? "requirements" : loaded.draftStep === "settings" ? "settings" : loaded.draftStep === "quote" ? "quote" : "references";
           router.replace(`/projects/${loaded.id}/${draftRoute}`);
         }
+        if (view === "progress" && loaded.status === "awaiting_review") {
+          const destination = reviewRoute(loaded);
+          if (destination) router.replace(destination);
+        }
         if (view === "progress" && loaded.status === "completed") router.replace(`/projects/${loaded.id}/delivery`);
         if (view === "result" && loaded.status !== "completed") router.replace(`/projects/${loaded.id}/progress`);
       })
@@ -263,6 +278,10 @@ export function Studio({ view = "references", projectId }: { view?: StudioView; 
         const data = (await response.json()) as { project: Project };
         setProject(data.project);
         draftVersionRef.current = data.project.draftVersion;
+        if (data.project.status === "awaiting_review") {
+          const destination = reviewRoute(data.project);
+          if (destination) router.replace(destination);
+        }
         if (data.project.status === "completed") router.replace(`/projects/${data.project.id}/delivery`);
       } catch {
         // The persisted project stays visible while a transient poll fails.
@@ -614,11 +633,11 @@ export function Studio({ view = "references", projectId }: { view?: StudioView; 
 
           <div className={`portrait-monitor is-processing ${project.keyframeUrl ? "has-keyframe" : ""}`}>
             <div className="monitor-topline"><span>MONITOR A</span><span>9:16 · 24 FPS</span></div>
-            {project.keyframeUrl && <Image className="keyframe-preview" src={project.keyframeUrl} alt="Seedream 生成的首帧关键视觉" fill sizes="(max-width: 820px) 62vh, 390px" unoptimized />}
+            {project.keyframeUrl && <Image className="keyframe-preview" src={project.keyframeUrl} alt="Seedream 生成的已确认分镜画面" fill sizes="(max-width: 820px) 62vh, 390px" unoptimized />}
             <div className="focus-corners" aria-hidden="true"><i /><i /><i /><i /></div>
             {!project.keyframeUrl && <div className="processing-orbit" aria-hidden="true"><span /><span /><span /></div>}
-            {project.pipelinePhase === "generating_keyframe" && !project.keyframeUrl && <div className="keyframe-live"><i /><span>SEEDREAM</span><strong>正在生成首帧关键视觉</strong><small>主体 · 场景 · 构图 · 光线</small></div>}
-            {project.keyframeUrl && <div className="keyframe-ready"><span>KEYFRAME READY</span><small>{project.keyframeModel ?? "Seedream 5.0 Lite"} · {project.keyframeSize ?? "2K"}</small></div>}
+            {project.pipelinePhase === "generating_images" && !project.keyframeUrl && <div className="keyframe-live"><i /><span>SEEDREAM</span><strong>正在生成4张连贯分镜</strong><small>主体 · 场景 · 构图 · 光线</small></div>}
+            {project.keyframeUrl && <div className="keyframe-ready"><span>STORYBOARD READY</span><small>{project.keyframeModel ?? "Seedream 5.0 Lite"} · 4 FRAMES</small></div>}
             <div className={`monitor-copy ${project.keyframeUrl ? "over-keyframe" : ""}`}>
               <span>{currentCopy.eyebrow}</span>
               <strong>{currentCopy.title}</strong>
@@ -639,7 +658,7 @@ export function Studio({ view = "references", projectId }: { view?: StudioView; 
             </dl>
             <div className="status-note">
               <span className="note-mark">{isStopped ? "!" : project.status === "quality_checking" ? "↻" : "i"}</span>
-              <p>{isStopped ? "任务已经终止，不会继续消耗模型额度。请返回重新检查输入后创建新任务。" : project.status === "quality_checking" ? "发现画面问题时，系统会自动优化局部镜头。" : "现在不需要操作。制作完成后会自动进入交付页。"}</p>
+              <p>{isStopped ? "任务已经终止，不会继续执行后续模型步骤。请返回重新检查输入后创建新任务。" : project.status === "quality_checking" ? "正在做交付前硬质检；主题跑偏、主体漂移或命中禁项都会停止交付。" : "现在不需要操作。制作完成后会自动进入交付页。"}</p>
             </div>
             <div className="live-stream" aria-live="polite">
               <div className="stream-head"><span>实时输出</span><i>{isStopped ? "STOPPED" : "LIVE"}</i></div>
@@ -804,12 +823,12 @@ export function Studio({ view = "references", projectId }: { view?: StudioView; 
             <div className="section-heading"><span className="section-number">04</span><div><h2>成本确认</h2><p>以下为真实平台成本预估，不包含销售利润。</p></div></div>
             <div className="quote-total"><span>本次预计平台成本</span><strong>￥{quote.totalMin.toFixed(2)} <i>—</i> ￥{quote.totalMax.toFixed(2)}</strong><p>实际金额以火山方舟任务完成后返回的用量为准。</p></div>
             <div className="quote-breakdown">
-              <div><span><b>01</b>参考视频 AI 解析</span><strong>￥{quote.analysis.min.toFixed(2)} — ￥{quote.analysis.max.toFixed(2)}</strong><small>{quote.referenceCount} 个参考视频 · 解析高光、节奏与创意机制</small></div>
-              <div><span><b>02</b>Seedream 首帧关键视觉</span><strong>￥{quote.keyframe.min.toFixed(2)}</strong><small>1 张 · 9:16 · 2K · 用作 Seedance 图生视频首帧</small></div>
+              <div><span><b>01</b>视频解析、创意规划与双重质检</span><strong>￥{quote.analysis.min.toFixed(2)} — ￥{quote.analysis.max.toFixed(2)}</strong><small>{quote.referenceCount} 个参考 · 解析融合 · 图片质量复核 · 成片语义复核</small></div>
+              <div><span><b>02</b>Seedream 连贯分镜组图</span><strong>￥{quote.storyboard.min.toFixed(2)}</strong><small>{quote.storyboard.count} 张 · 9:16 · 2K · 先审提示词，再生成并进入画布确认</small></div>
               <div><span><b>03</b>Seedance 视频生成</span><strong>￥{quote.generation.min.toFixed(2)} — ￥{quote.generation.max.toFixed(2)}</strong><small>{quote.model} · {quote.duration} 秒 · 9:16 · 1080p</small></div>
               <div><span><b>04</b>成片归档与存储</span><strong>￥{quote.storage.min.toFixed(2)} — ￥{quote.storage.max.toFixed(2)}</strong><small>下载、完整性校验并保存到对象存储</small></div>
             </div>
-            <div className="quote-gate"><span>尚未启动任何 AI 视频解析或生成</span><p>点击确认后才会依次启动参考解析、创意融合和 Seedance 生成。任一步失败都会立即停止。</p></div>
+            <div className="quote-gate"><span>尚未启动任何 AI 视频解析或生成</span><p>确认成本后先解析参考；创意、4张图片提示词和分镜画布都必须由你逐步确认。任一步失败都会立即停止。</p></div>
           </section>}
         </div>
 
@@ -820,7 +839,7 @@ export function Studio({ view = "references", projectId }: { view?: StudioView; 
           <dl className="spec-list"><div><dt>平台</dt><dd>{platform}</dd></div><div><dt>目标</dt><dd>{goal}</dd></div><div><dt>风格</dt><dd>{style}</dd></div><div><dt>生成模型</dt><dd>{modelLabel}</dd></div></dl>
           <div className="cost-box"><div><span>预计平台成本</span><strong>￥{quote.totalMin.toFixed(2)}—￥{quote.totalMax.toFixed(2)}</strong></div><p>{view === "quote" ? "等待你确认；当前尚未启动 AI 视频解析。" : "进入成本确认页后，确认才会启动解析与生成。"}</p></div>
           {view === "spec" && <label className="rights-check"><input type="checkbox" checked={rightsConfirmed} onChange={(event) => setRightsConfirmed(event.target.checked)} /><span aria-hidden="true">✓</span><p>我确认有权将所提交的素材用于内部分析和视频制作。</p></label>}
-          {view === "quote" && <label className="rights-check cost-confirm"><input type="checkbox" checked={costAccepted} onChange={(event) => setCostAccepted(event.target.checked)} /><span aria-hidden="true">✓</span><p>我已了解预计平台成本区间，同意确认后开始解析参考视频并生成成片。</p></label>}
+          {view === "quote" && <label className="rights-check cost-confirm"><input type="checkbox" checked={costAccepted} onChange={(event) => setCostAccepted(event.target.checked)} /><span aria-hidden="true">✓</span><p>我已了解预计平台成本区间，同意开始解析参考视频；后续仍需逐步确认创意、图片提示词和画布。</p></label>}
           {message && <div className="form-message" role="alert">{message}</div>}
           <button className="start-button" disabled={nextDisabled || submitting || !activeProjectId} onClick={nextAction}><span>{nextLabel}</span><i>→</i></button>
           <p className="dock-footnote">当前步骤保存成功后才会进入下一页。</p>
