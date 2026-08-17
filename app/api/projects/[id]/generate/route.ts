@@ -10,6 +10,7 @@ function ownerId(request: Request) {
 }
 
 function present(row: typeof projects.$inferSelect) {
+  const pipeline = row.pipelineJson ? JSON.parse(row.pipelineJson) as { phase?: string; events?: unknown[] } : null;
   return {
     id: row.id,
     title: row.title,
@@ -18,6 +19,9 @@ function present(row: typeof projects.$inferSelect) {
     draftVersion: row.draftVersion,
     progress: row.progress,
     runMode: row.runMode,
+    pipelinePhase: pipeline?.phase ?? null,
+    activity: pipeline?.events ?? [],
+    error: row.errorJson ? JSON.parse(row.errorJson) : null,
     createdAt: row.runStartedAt ?? row.createdAt,
     updatedAt: row.updatedAt,
     input: JSON.parse(row.inputJson),

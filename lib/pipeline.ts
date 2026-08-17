@@ -56,6 +56,14 @@ type CreativeCard = {
   quality_risks?: string[];
 };
 
+export type PipelineActivityEvent = {
+  id: string;
+  phase: string;
+  message: string;
+  createdAt: string;
+  level?: "info" | "success" | "warning" | "error";
+};
+
 export type ArkPipelineState = {
   phase: "ingesting" | "waiting_file" | "synthesizing" | "submitting_video" | "polling_video";
   referenceIndex: number;
@@ -63,6 +71,7 @@ export type ArkPipelineState = {
   currentFileId?: string;
   creative?: CreativeCard;
   taskId?: string;
+  events?: PipelineActivityEvent[];
 };
 
 export type PipelineSnapshot = {
@@ -128,7 +137,7 @@ export async function submitPipeline(input: PipelineInput): Promise<PipelineSnap
     status: "ingesting",
     progress: 4,
     providerJobId: `ark_${input.projectId}`,
-    state: { phase: "ingesting", referenceIndex: 0, analyses: [] },
+    state: withEvent({ phase: "ingesting", referenceIndex: 0, analyses: [] }, "prepare", "制作任务已创建，开始读取参考素材"),
   };
 }
 
@@ -149,14 +158,15 @@ export async function readPipeline(args: {
     return await advanceArkPipeline(args.input, args.state, args.ownerId);
   } catch (error) {
     const message = error instanceof Error ? error.message : "火山方舟调用失败";
-    return failure("ArkPipelineError", message);
+    if (args.state.taskId) await cancelArkTask(args.state.taskId);
+    return failure("ArkPipelineError", message, args.state);
   }
 }
 
 async function advanceArkPipeline(input: PipelineInput, state: ArkPipelineState, ownerId: string): Promise<PipelineSnapshot> {
   if (state.phase === "ingesting") {
     if (state.referenceIndex >= input.references.length) {
-      return { status: "analyzing", progress: 32, state: { ...state, phase: "synthesizing" } };
+      return { status: "analyzing", progress: 32, state: withEvent({ ...state, phase: "synthesizing" }, "creative", "所有参考解析完成，开始比较并融合创意") };
     }
     const reference = input.references[state.referenceIndex];
     if (reference.kind === "file" && typeof reference.uploadId === "string") {
@@ -172,12 +182,13 @@ async function advanceArkPipeline(input: PipelineInput, state: ArkPipelineState,
       return {
         status: "ingesting",
         progress: referenceProgress(state.referenceIndex, input.references.length),
-        state: { ...state, phase: "waiting_file", currentFileId: file.id },
+        state: withEvent({ ...state, phase: "waiting_file", currentFileId: file.id }, "preprocess", `参考 ${state.referenceIndex + 1} 已上传方舟，等待视频预处理`),
       };
     }
 
-    if (reference.kind === "url" && typeof reference.url === "string" && /^https?:\/\/.*\.(mp4|mov|webm)(\?|$)/i.test(reference.url)) {
-      const analysis = await analyzeReference({ videoUrl: reference.url }, reference, state.referenceIndex);
+    const referenceUrl = typeof reference.resolvedUrl === "string" ? reference.resolvedUrl : reference.url;
+    if (reference.kind === "url" && typeof referenceUrl === "string" && (/^https?:\/\/.*\.(mp4|mov|webm)(\?|$)/i.test(referenceUrl) || reference.directVideo === true)) {
+      const analysis = await analyzeReference({ videoUrl: referenceUrl }, reference, state.referenceIndex);
       return nextReferenceState(input, state, analysis);
     }
 
@@ -195,7 +206,7 @@ async function advanceArkPipeline(input: PipelineInput, state: ArkPipelineState,
     if (!state.currentFileId) throw new Error("方舟文件标识缺失");
     const file = await arkRequest<ArkFile>(`/files/${encodeURIComponent(state.currentFileId)}`);
     if (file.status === "processing") {
-      return { status: "ingesting", progress: referenceProgress(state.referenceIndex, input.references.length), state };
+      return { status: "ingesting", progress: referenceProgress(state.referenceIndex, input.references.length), state: withEvent(state, "preprocess", `参考 ${state.referenceIndex + 1} 正在预处理画面与声音`) };
     }
     if (file.status !== "active") {
       throw new Error(file.error?.message || `参考视频预处理失败（${file.status || "unknown"}）`);
@@ -210,7 +221,7 @@ async function advanceArkPipeline(input: PipelineInput, state: ArkPipelineState,
     return {
       status: "generating_assets",
       progress: 46,
-      state: { ...state, phase: "submitting_video", creative, currentFileId: undefined },
+      state: withEvent({ ...state, phase: "submitting_video", creative, currentFileId: undefined }, "storyboard", `唯一创意已收敛：${creative.theme || creative.concept || "原创短视频方案"}`),
     };
   }
 
@@ -220,14 +231,14 @@ async function advanceArkPipeline(input: PipelineInput, state: ArkPipelineState,
       status: "generating_video",
       progress: 55,
       providerJobId: task.id,
-      state: { ...state, phase: "polling_video", taskId: task.id },
+      state: withEvent({ ...state, phase: "polling_video", taskId: task.id }, "seedance_submit", "Seedance 2.0 任务已提交，正在等待生成资源"),
     };
   }
 
   if (!state.taskId) throw new Error("Seedance 任务标识缺失");
   const task = await arkRequest<ArkVideoTask>(`/contents/generations/tasks/${encodeURIComponent(state.taskId)}`);
-  if (task.status === "queued") return { status: "generating_video", progress: 62, providerJobId: task.id, state };
-  if (task.status === "running") return { status: "quality_checking", progress: 78, providerJobId: task.id, state };
+  if (task.status === "queued") return { status: "generating_video", progress: 62, providerJobId: task.id, state: withEvent(state, "seedance_queue", "Seedance 正在排队，任务状态正常") };
+  if (task.status === "running") return { status: "quality_checking", progress: 78, providerJobId: task.id, state: withEvent(state, "seedance_render", "Seedance 正在渲染画面、动作与声音") };
   if (task.status !== "succeeded" || !task.content?.video_url) {
     return failure(task.error?.code || `Seedance${task.status}`, task.error?.message || `视频生成任务状态：${task.status}`, state);
   }
@@ -239,7 +250,7 @@ async function advanceArkPipeline(input: PipelineInput, state: ArkPipelineState,
     status: "completed",
     progress: 100,
     providerJobId: task.id,
-    state,
+    state: withEvent(state, "delivery", "成片已生成、完整性校验通过并归档", "success"),
     result: {
       videoObjectKey: objectKey,
       videoUrl: `/api/media/${encodeURIComponent(objectKey)}`,
@@ -260,6 +271,7 @@ function nextReferenceState(input: PipelineInput, state: ArkPipelineState, analy
       phase: nextIndex >= input.references.length ? "synthesizing" : "ingesting",
       referenceIndex: nextIndex,
       analyses: [...state.analyses, analysis],
+      events: withEvent(state, "reference_analysis", `参考 ${nextIndex} 的画面、节奏与创意机制解析完成`, "success").events,
     },
   };
 }
@@ -418,7 +430,22 @@ function parseModelJson(text: string): Record<string, unknown> {
 }
 
 function failure(code: string, message: string, state?: ArkPipelineState): PipelineSnapshot {
-  return { status: "failed", progress: 100, state, error: { code, message } };
+  const progressByPhase: Record<ArkPipelineState["phase"], number> = { ingesting: 12, waiting_file: 18, synthesizing: 38, submitting_video: 52, polling_video: 72 };
+  return { status: "failed", progress: state ? progressByPhase[state.phase] : 0, state: state ? withEvent(state, "failed", `任务中断：${message}`, "error") : state, error: { code, message } };
+}
+
+async function cancelArkTask(taskId: string) {
+  try { await arkRequest<null>(`/contents/generations/tasks/${encodeURIComponent(taskId)}`, { method: "DELETE" }); } catch { /* A running task cannot be cancelled; keep the local task terminal. */ }
+}
+
+function withEvent(state: ArkPipelineState, phase: string, message: string, level: PipelineActivityEvent["level"] = "info"): ArkPipelineState {
+  const events = state.events ?? [];
+  const last = events.at(-1);
+  if (last?.message === message && Date.now() - new Date(last.createdAt).getTime() < 10_000) return state;
+  return {
+    ...state,
+    events: [...events, { id: crypto.randomUUID(), phase, message, level, createdAt: new Date().toISOString() }].slice(-80),
+  };
 }
 
 function demoSnapshot(createdAt: string): PipelineSnapshot {

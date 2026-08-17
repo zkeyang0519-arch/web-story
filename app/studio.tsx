@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
 
 type ReferenceItem = {
@@ -13,7 +13,15 @@ type ReferenceItem = {
   priority: boolean;
   emphasis: string[];
   uploadId?: string;
+  resolvedUrl?: string;
+  directVideo?: boolean;
+  status?: "pending" | "processing" | "ready" | "failed";
+  progress?: number;
+  statusText?: string;
+  error?: string;
 };
+
+type ActivityEvent = { id: string; phase: string; message: string; createdAt: string; level?: "info" | "success" | "warning" | "error" };
 
 type ProjectResult = {
   videoUrl?: string;
@@ -31,6 +39,9 @@ type Project = {
   draftVersion: number;
   progress: number;
   runMode: "demo" | "production";
+  pipelinePhase?: string | null;
+  activity?: ActivityEvent[];
+  error?: { code?: string; message?: string } | null;
   createdAt: string;
   updatedAt: string;
   input: {
@@ -60,26 +71,16 @@ type SystemInfo = {
 
 type StudioView = "references" | "brief" | "spec" | "progress" | "result";
 
-const stages = [
-  { key: "ingesting", label: "处理参考视频", short: "参考" },
-  { key: "analyzing", label: "分析创意", short: "创意" },
-  { key: "generating_assets", label: "准备视觉素材", short: "视觉" },
-  { key: "generating_video", label: "生成视频镜头", short: "镜头" },
-  { key: "quality_checking", label: "质检和优化", short: "质检" },
-  { key: "post_processing", label: "完成配音与剪辑", short: "剪辑" },
+const processSteps = [
+  { key: "receive", label: "接收并校验参考素材", detail: "确认文件、链接与素材权限", end: 6 },
+  { key: "preprocess", label: "方舟文件预处理", detail: "上传并准备画面与声音轨道", end: 18 },
+  { key: "understand", label: "逐条视频内容解析", detail: "提取高光、节奏与创意机制", end: 30 },
+  { key: "creative", label: "创意比较与融合", detail: "只收敛一个原创创意方向", end: 46 },
+  { key: "storyboard", label: "镜头计划与生成提示词", detail: "整理15秒时间轴和一致性约束", end: 55 },
+  { key: "submit", label: "提交 Seedance 2.0", detail: "创建任务并等待生成资源", end: 63 },
+  { key: "render", label: "渲染画面、动作与声音", detail: "实时查询 Seedance 任务状态", end: 90 },
+  { key: "deliver", label: "质量校验、归档与交付", detail: "下载成片并校验文件完整性", end: 101 },
 ] as const;
-
-const stageIndex: Record<string, number> = {
-  ingesting: 0,
-  analyzing: 1,
-  planning: 1,
-  generating_assets: 2,
-  generating_video: 3,
-  quality_checking: 4,
-  post_processing: 5,
-  final_checking: 5,
-  completed: 6,
-};
 
 const goals = ["品牌种草", "传播表达", "剧情故事", "知识解释", "情绪氛围", "视觉展示"];
 const styles = ["真实生活感", "电影叙事", "清透商业", "快速网感", "克制高级"];
@@ -132,6 +133,8 @@ function statusCopy(status: string) {
     quality_checking: { eyebrow: "质量门检查中", title: "发现问题会只重做局部镜头", detail: "检查主体一致性、运动合理性、文字、节奏与画面瑕疵。" },
     post_processing: { eyebrow: "最后装配", title: "正在完成声音、字幕与节奏", detail: "配音、环境声、版权安全音乐和字幕统一完成后进入终检。" },
     final_checking: { eyebrow: "最终检查", title: "离交付只差最后一道门", detail: "验证成片规格、音画同步、黑帧与文件完整性。" },
+    failed: { eyebrow: "任务已停止", title: "制作过程遇到错误", detail: "后续步骤已经停止，请查看右侧实时输出和错误说明。" },
+    cancelled: { eyebrow: "任务已结束", title: "这次制作已被取消", detail: "系统不会继续调用模型或生成视频。" },
   };
   return copy[status] ?? copy.ingesting;
 }
@@ -204,7 +207,7 @@ export function Studio({ view = "references", projectId }: { view?: StudioView; 
         setProject(loaded);
         draftVersionRef.current = loaded.draftVersion;
         const input = loaded.input;
-        if (input.references) setReferences(input.references.map((item) => ({ ...item, file: undefined })));
+        if (input.references) setReferences(input.references.map((item) => ({ ...item, file: undefined, status: "ready", progress: 100, statusText: item.kind === "file" ? "上传完成" : "解析完成" })));
         if (input.topicMode) setTopicMode(input.topicMode);
         if (typeof input.topic === "string") setTopic(input.topic);
         if (input.goal) setGoal(input.goal);
@@ -252,7 +255,7 @@ export function Studio({ view = "references", projectId }: { view?: StudioView; 
     return () => window.clearInterval(timer);
   }, [activeProjectId, router, view]);
 
-  const addFiles = useCallback((files: FileList | File[]) => {
+  function addFiles(files: FileList | File[]) {
     setMessage("");
     const current = references.length;
     const accepted = Array.from(files).filter((file) => {
@@ -263,12 +266,13 @@ export function Studio({ view = "references", projectId }: { view?: StudioView; 
       setMessage("部分文件未添加：仅支持有效的 MP4、MOV 或 WebM 视频。 ");
     }
     const next = accepted.slice(0, Math.max(0, 10 - current)).map((file) => ({
-      id: uid(), kind: "file" as const, name: file.name, file, size: file.size, priority: false, emphasis: ["节奏", "画面"],
+      id: uid(), kind: "file" as const, name: file.name, file, size: file.size, priority: false, emphasis: ["节奏", "画面"], status: "pending" as const, progress: 0, statusText: "等待上传",
     }));
     setReferences((items) => [...items, ...next]);
-  }, [references.length]);
+    next.forEach((item) => void processFileReference(item));
+  }
 
-  function addUrl() {
+  async function addUrl() {
     const value = urlDraft.trim();
     if (!value) return;
     if (references.length >= 10) return setMessage("最多添加 10 个参考视频。 ");
@@ -276,16 +280,18 @@ export function Studio({ view = "references", projectId }: { view?: StudioView; 
       return setMessage("请输入完整的抖音或小红书分享链接。 ");
     }
     const source = /xiaohongshu|xhslink/i.test(value) ? "小红书参考" : /douyin/i.test(value) ? "抖音参考" : "视频链接";
-    setReferences((items) => [...items, { id: uid(), kind: "url", name: `${source} ${items.length + 1}`, url: value, priority: false, emphasis: ["开头", "节奏"] }]);
+    const item: ReferenceItem = { id: uid(), kind: "url", name: `${source} ${references.length + 1}`, url: value, priority: false, emphasis: ["开头", "节奏"], status: value.startsWith("demo://") ? "ready" : "processing", progress: value.startsWith("demo://") ? 100 : 12, statusText: value.startsWith("demo://") ? "解析完成" : "正在解析链接" };
+    setReferences((items) => [...items, item]);
     setUrlDraft("");
     setMessage("");
+    if (!value.startsWith("demo://")) await parseLinkReference(item);
   }
 
   function loadDemoReferences() {
     setReferences([
-      { id: uid(), kind: "url", name: "示例参考 · 清晨咖啡", url: "demo://morning-coffee", priority: true, emphasis: ["开头", "画面"] },
-      { id: uid(), kind: "url", name: "示例参考 · 城市节奏", url: "demo://city-rhythm", priority: false, emphasis: ["节奏", "声音"] },
-      { id: uid(), kind: "url", name: "示例参考 · 产品特写", url: "demo://product-detail", priority: false, emphasis: ["画面", "反转"] },
+      { id: uid(), kind: "url", name: "示例参考 · 清晨咖啡", url: "demo://morning-coffee", priority: true, emphasis: ["开头", "画面"], status: "ready", progress: 100, statusText: "解析完成" },
+      { id: uid(), kind: "url", name: "示例参考 · 城市节奏", url: "demo://city-rhythm", priority: false, emphasis: ["节奏", "声音"], status: "ready", progress: 100, statusText: "解析完成" },
+      { id: uid(), kind: "url", name: "示例参考 · 产品特写", url: "demo://product-detail", priority: false, emphasis: ["画面", "反转"], status: "ready", progress: 100, statusText: "解析完成" },
     ]);
     setTopicMode("ai");
     setGoal("品牌种草");
@@ -309,7 +315,41 @@ export function Studio({ view = "references", projectId }: { view?: StudioView; 
   }
 
   function serializableReferences(items = references) {
-    return items.map((item) => ({ id: item.id, kind: item.kind, name: item.name, url: item.url, size: item.size, priority: item.priority, emphasis: item.emphasis, uploadId: item.uploadId }));
+    return items.map((item) => ({ id: item.id, kind: item.kind, name: item.name, url: item.url, resolvedUrl: item.resolvedUrl, directVideo: item.directVideo, size: item.size, priority: item.priority, emphasis: item.emphasis, uploadId: item.uploadId }));
+  }
+
+  function updateReference(id: string, patch: Partial<ReferenceItem>) {
+    setReferences((items) => items.map((item) => item.id === id ? { ...item, ...patch } : item));
+  }
+
+  async function processFileReference(item: ReferenceItem) {
+    updateReference(item.id, { status: "processing", progress: 2, statusText: "准备上传", error: undefined });
+    try {
+      const uploaded = await uploadReference(item, (progress, statusText) => updateReference(item.id, { status: "processing", progress, statusText }));
+      updateReference(item.id, { status: "ready", progress: 100, statusText: "上传完成并校验", uploadId: uploaded.uploadId, error: undefined });
+    } catch (error) {
+      updateReference(item.id, { status: "failed", statusText: "上传失败", error: error instanceof Error ? error.message : "上传失败" });
+    }
+  }
+
+  async function parseLinkReference(item: ReferenceItem) {
+    if (!activeProjectId || !item.url) {
+      updateReference(item.id, { status: "failed", statusText: "解析失败", error: "草稿尚未准备好" });
+      return;
+    }
+    updateReference(item.id, { status: "processing", progress: 18, statusText: "正在解析分享链接", error: undefined });
+    try {
+      const response = await fetch("/api/references/inspect", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ projectId: activeProjectId, url: item.url }),
+      });
+      const result = await response.json().catch(() => null) as { reference?: { resolvedUrl?: string; directVideo?: boolean; note?: string }; error?: string } | null;
+      if (!response.ok || !result?.reference) throw new Error(result?.error ?? "链接解析失败");
+      updateReference(item.id, { status: "ready", progress: 100, statusText: result.reference.note ?? "解析完成", resolvedUrl: result.reference.resolvedUrl, directVideo: result.reference.directVideo, error: undefined });
+    } catch (error) {
+      updateReference(item.id, { status: "failed", progress: 100, statusText: "解析失败", error: error instanceof Error ? error.message : "链接解析失败" });
+    }
   }
 
   async function patchDraft(step: "references" | "requirements" | "settings", data: Record<string, unknown>, advance = false) {
@@ -326,7 +366,7 @@ export function Studio({ view = "references", projectId }: { view?: StudioView; 
     return result.project;
   }
 
-  async function uploadReference(item: ReferenceItem) {
+  async function uploadReference(item: ReferenceItem, onProgress?: (progress: number, status: string) => void) {
     if (!item.file) return { name: item.name, kind: item.kind, url: item.url, uploadId: item.uploadId, priority: item.priority, emphasis: item.emphasis };
     if (!activeProjectId) throw new Error("草稿尚未准备好，请稍后重试。");
     const startResponse = await fetch("/api/uploads", {
@@ -350,12 +390,12 @@ export function Studio({ view = "references", projectId }: { view?: StudioView; 
     for (let partNumber = 1; partNumber <= partCount; partNumber += 1) {
       const start = (partNumber - 1) * partSize;
       const chunk = item.file.slice(start, Math.min(start + partSize, item.file.size));
-      const percent = Math.min(99, Math.round((start / item.file.size) * 100));
-      setSubmitLabel(`上传 ${item.name} · ${percent}%`);
+      onProgress?.(Math.max(4, Math.round((start / item.file.size) * 90)), `上传分片 ${partNumber}/${partCount}`);
       parts.push(await uploadPartWithRetry(`/api/uploads/${id}/parts/${partNumber}`, chunk));
+      onProgress?.(Math.min(94, Math.round((partNumber / partCount) * 90)), `已上传 ${partNumber}/${partCount} 分片`);
     }
 
-    setSubmitLabel(`校验 ${item.name} · 100%`);
+    onProgress?.(96, "正在合并并校验文件");
     const completeResponse = await fetch(`/api/uploads/${id}/complete`, {
       method: "POST",
       headers: { "content-type": "application/json" },
@@ -371,18 +411,11 @@ export function Studio({ view = "references", projectId }: { view?: StudioView; 
   async function continueFromReferences() {
     setMessage("");
     if (!references.length) return setMessage("请先添加至少一个参考视频。 ");
+    if (references.some((item) => item.status !== "ready")) return setMessage("请等待所有视频上传或链接解析完成。 ");
     setSubmitting(true);
     try {
-      const normalized: ReferenceItem[] = references.map((item) => ({ ...item }));
-      for (let index = 0; index < references.length; index += 1) {
-        const item = normalized[index];
-        setSubmitLabel(item.file ? `上传参考 ${index + 1}/${references.length}` : `检查参考 ${index + 1}/${references.length}`);
-        const uploaded = await uploadReference(item);
-        normalized[index] = { id: item.id, kind: item.kind, name: item.name, url: item.url, size: item.size, priority: item.priority, emphasis: item.emphasis, uploadId: uploaded.uploadId };
-        setReferences([...normalized]);
-        if (item.file) await patchDraft("references", { references: serializableReferences(normalized) });
-      }
-      await patchDraft("references", { references: serializableReferences(normalized) }, true);
+      setSubmitLabel("保存参考素材");
+      await patchDraft("references", { references: serializableReferences(references) }, true);
       router.push(`/projects/${activeProjectId}/requirements`);
     } catch (error) {
       setMessage(error instanceof Error ? error.message : "参考视频处理失败，请重试。 ");
@@ -479,7 +512,11 @@ export function Studio({ view = "references", projectId }: { view?: StudioView; 
   }
 
   const priorityCount = references.filter((item) => item.priority).length;
-  const currentStage = project ? Math.min(stageIndex[project.status] ?? 0, 6) : 0;
+  const referencesReady = references.length > 0 && references.every((item) => item.status === "ready");
+  const referencesProcessing = references.some((item) => item.status === "pending" || item.status === "processing");
+  const isStopped = Boolean(project && ["failed", "cancelled"].includes(project.status));
+  const currentProcessIndex = project?.status === "completed" ? processSteps.length : Math.max(0, processSteps.findIndex((step) => (project?.progress ?? 0) < step.end));
+  const processDoneCount = project?.status === "completed" ? processSteps.length : currentProcessIndex;
   const currentCopy = project ? statusCopy(project.status) : statusCopy("ingesting");
   const shotTotal = duration === 15 ? 6 : duration === 30 ? 9 : 14;
   const shotsDone = project ? Math.min(shotTotal, Math.max(0, Math.round((project.progress - 42) / 58 * shotTotal))) : 0;
@@ -494,8 +531,8 @@ export function Studio({ view = "references", projectId }: { view?: StudioView; 
       ? { eyebrow: "STEP 02 / CREATIVE BRIEF", first: "说清楚，", second: "这条视频要打动谁。", lead: "确定主题来源、内容目标和目标观众，然后再确认最终成片规格。" }
       : { eyebrow: "STEP 03 / PRODUCTION SPEC", first: "最后确认，", second: "成片怎么交付。", lead: "确认平台、时长、画面风格与素材权利后，系统才会正式开始制作。" };
   const nextAction = view === "references" ? continueFromReferences : view === "brief" ? continueFromBrief : startProduction;
-  const nextDisabled = view === "references" ? references.length === 0 : view === "brief" ? !canBriefContinue : !canStart;
-  const nextLabel = submitting ? submitLabel : view === "references" ? "下一步：创作要求" : view === "brief" ? "下一步：成片设置" : "开始制片";
+  const nextDisabled = view === "references" ? !referencesReady : view === "brief" ? !canBriefContinue : !canStart;
+  const nextLabel = submitting ? submitLabel : view === "references" ? referencesProcessing ? "等待素材处理完成" : "下一步：创作要求" : view === "brief" ? "下一步：成片设置" : "开始制片";
 
   if (projectId && ["references", "brief", "spec"].includes(view) && !project) {
     return <ProjectLoading system={system} label="正在恢复制片草稿" />;
@@ -506,6 +543,7 @@ export function Studio({ view = "references", projectId }: { view?: StudioView; 
   }
 
   if (view === "progress" && project) {
+    const activity = project.activity?.length ? project.activity : [{ id: "current", phase: project.pipelinePhase ?? project.status, message: currentCopy.detail, createdAt: project.updatedAt, level: isStopped ? "error" as const : "info" as const }];
     return (
       <main className="studio-shell progress-shell">
         <Topbar system={system} compact />
@@ -513,21 +551,23 @@ export function Studio({ view = "references", projectId }: { view?: StudioView; 
           <div>
             <button className="text-button" onClick={() => router.push("/")}>← 返回制片单</button>
             <p className="eyebrow">任务 {project.id.slice(0, 8).toUpperCase()}</p>
-            <h1>正在制作视频</h1>
-            <p>任务会在后台继续运行，你可以安全离开此页面。</p>
+            <h1>{isStopped ? project.status === "cancelled" ? "任务已结束" : "制作已停止" : "正在制作视频"}</h1>
+            <p>{isStopped ? "系统已停止后续步骤，请查看错误并重新输入。" : "任务会在后台继续运行，你可以安全离开此页面。"}</p>
           </div>
-          <div className="run-chip"><span className="live-dot" /> {project.runMode === "demo" ? "演示管线" : "生产管线"}</div>
+          <div className={`run-chip ${isStopped ? "stopped" : ""}`}><span className="live-dot" /> {isStopped ? "任务已停止" : project.runMode === "demo" ? "演示管线" : "生产管线"}</div>
         </section>
+
+        {isStopped && <section className="run-error wrap" role="alert"><div><span>{project.status === "cancelled" ? "CANCELLED" : "FAILED"}</span><strong>{project.error?.message || (project.status === "cancelled" ? "任务已由用户结束" : "制作过程中发生错误")}</strong><p>不会继续执行任何后续模型任务。请重新检查素材、链接或创作要求后再提交。</p></div><button onClick={() => router.push("/")}>重新输入并创建新任务 →</button></section>}
 
         <section className="monitor-grid wrap">
           <aside className="stage-rail" aria-label="制作阶段">
             <div className="section-kicker">制作轨道</div>
-            {stages.map((stage, index) => {
-              const state = index < currentStage ? "done" : index === currentStage ? "active" : "pending";
+            {processSteps.map((stage, index) => {
+              const state = index < currentProcessIndex ? "done" : index === currentProcessIndex ? isStopped ? "failed" : "active" : "pending";
               return (
                 <div className={`stage-item ${state}`} key={stage.key}>
-                  <span className="stage-index">{state === "done" ? "✓" : String(index + 1).padStart(2, "0")}</span>
-                  <span><strong>{stage.label}</strong><small>{state === "done" ? "已完成" : state === "active" ? "正在进行" : "等待"}</small></span>
+                  <span className="stage-index">{state === "done" ? "✓" : state === "failed" ? "!" : String(index + 1).padStart(2, "0")}</span>
+                  <span><strong>{stage.label}</strong><small>{state === "done" ? "已完成" : state === "active" ? `正在进行 · ${stage.detail}` : state === "failed" ? "失败并停止" : `等待 · ${stage.detail}`}</small></span>
                 </div>
               );
             })}
@@ -547,7 +587,7 @@ export function Studio({ view = "references", projectId }: { view?: StudioView; 
 
           <aside className="run-inspector">
             <div className="section-kicker">实时监看</div>
-            <div className="big-progress"><strong>{currentStage >= 6 ? 6 : currentStage}</strong><span>/ 6 阶段完成</span></div>
+            <div className="big-progress"><strong>{processDoneCount}</strong><span>/ {processSteps.length} 步完成</span></div>
             <div className="meter" aria-label={`整体进度 ${project.progress}%`}><span style={{ width: `${project.progress}%` }} /></div>
             <dl className="run-stats">
               <div><dt>已用时间</dt><dd>{formatElapsed(project.createdAt)}</dd></div>
@@ -556,8 +596,15 @@ export function Studio({ view = "references", projectId }: { view?: StudioView; 
               <div><dt>平台成本</dt><dd>{project.runMode === "demo" ? "￥0.00" : "计算中"}</dd></div>
             </dl>
             <div className="status-note">
-              <span className="note-mark">{project.status === "quality_checking" ? "↻" : "i"}</span>
-              <p>{project.status === "quality_checking" ? "发现画面问题时，系统会自动优化局部镜头。" : "现在不需要操作。制作完成后会自动进入交付页。"}</p>
+              <span className="note-mark">{isStopped ? "!" : project.status === "quality_checking" ? "↻" : "i"}</span>
+              <p>{isStopped ? "任务已经终止，不会继续消耗模型额度。请返回重新检查输入后创建新任务。" : project.status === "quality_checking" ? "发现画面问题时，系统会自动优化局部镜头。" : "现在不需要操作。制作完成后会自动进入交付页。"}</p>
+            </div>
+            <div className="live-stream" aria-live="polite">
+              <div className="stream-head"><span>实时输出</span><i>{isStopped ? "STOPPED" : "LIVE"}</i></div>
+              <div className="stream-lines">
+                {activity.slice(-10).map((event) => <div className={`stream-line ${event.level ?? "info"}`} key={event.id}><time>{new Date(event.createdAt).toLocaleTimeString("zh-CN", { hour12: false, hour: "2-digit", minute: "2-digit", second: "2-digit" })}</time><p>{event.message}</p></div>)}
+                {!isStopped && <div className="stream-cursor"><span />等待下一条状态更新</div>}
+              </div>
             </div>
             <details className="diagnostics">
               <summary>管理员诊断</summary>
@@ -568,19 +615,19 @@ export function Studio({ view = "references", projectId }: { view?: StudioView; 
           </aside>
         </section>
 
-        <section className="contact-sheet wrap">
+        {!isStopped && <section className="contact-sheet wrap">
           <div className="contact-title"><span>SHOT CONTACT SHEET</span><span>{shotsDone}/{shotTotal} READY</span></div>
           <div className="shot-strip">
             {Array.from({ length: shotTotal }).map((_, index) => {
               const ready = index < shotsDone;
-              const active = index === shotsDone && currentStage >= 3 && currentStage < 6;
+              const active = index === shotsDone && currentProcessIndex >= 5 && currentProcessIndex < processSteps.length;
               return <div className={`shot-card shot-${index % 4} ${ready ? "ready" : ""} ${active ? "active" : ""}`} key={index}>
                 <span>SHOT {String(index + 1).padStart(2, "0")}</span>
                 <i>{ready ? "✓ 已通过" : active ? "生成中" : "等待"}</i>
               </div>;
             })}
           </div>
-        </section>
+        </section>}
       </main>
     );
   }
@@ -682,9 +729,10 @@ export function Studio({ view = "references", projectId }: { view?: StudioView; 
               {references.map((item, index) => <article className="reference-item" key={item.id}>
                 <div className={`reference-thumb thumb-${index % 4}`}><span>{item.kind === "file" ? "UP" : "URL"}</span><i>{String(index + 1).padStart(2, "0")}</i></div>
                 <div className="reference-main"><div className="reference-title"><strong>{item.name}</strong><small>{item.kind === "file" ? formatBytes(item.size) : item.url?.startsWith("demo://") ? "内置示例素材" : "分享链接"}</small></div>
+                  <div className={`reference-progress ${item.status ?? "ready"}`} aria-label={`${item.statusText ?? "处理完成"} ${item.progress ?? 100}%`}><div><span>{item.statusText ?? "处理完成"}</span><strong>{item.status === "processing" || item.status === "pending" ? `${item.progress ?? 0}%` : item.status === "failed" ? "需要重试" : "完成"}</strong></div><div className="reference-meter"><i style={{ width: `${item.progress ?? 100}%` }} /></div>{item.error && <small>{item.error}</small>}</div>
                   <div className="emphasis-row"><span>偏好</span>{emphasisOptions.map((entry) => <button className={item.emphasis.includes(entry) ? "selected" : ""} key={entry} onClick={() => toggleEmphasis(item.id, entry)}>{entry}</button>)}</div>
                 </div>
-                <div className="reference-actions"><button className={item.priority ? "priority active" : "priority"} onClick={() => togglePriority(item.id)}>{item.priority ? "★ 重点" : "☆ 设为重点"}</button><button className="remove" aria-label={`移除 ${item.name}`} onClick={() => setReferences((items) => items.filter((entry) => entry.id !== item.id))}>×</button></div>
+                <div className="reference-actions">{item.status === "failed" && <button className="retry" onClick={() => item.kind === "file" ? void processFileReference(item) : void parseLinkReference(item)}>重试</button>}<button className={item.priority ? "priority active" : "priority"} onClick={() => togglePriority(item.id)}>{item.priority ? "★ 重点" : "☆ 设为重点"}</button><button className="remove" aria-label={`移除 ${item.name}`} onClick={() => setReferences((items) => items.filter((entry) => entry.id !== item.id))}>×</button></div>
               </article>)}
             </div>}
           </section>}
