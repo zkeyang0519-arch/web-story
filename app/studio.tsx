@@ -48,7 +48,13 @@ type Project = {
   keyframeSize?: string | null;
   storyboardImages?: Array<{ frameId: string; order: number; url?: string | null; model?: string | null; size?: string | null }>;
   activity?: ActivityEvent[];
-  error?: { code?: string; message?: string } | null;
+  error?: { code?: string; message?: string; recoverable?: boolean; stage?: string; model?: string; attempts?: number } | null;
+  recovery?: {
+    retryable: boolean;
+    failedAt: string;
+    message: string;
+    attempts: Array<{ model: string; strategy: string; status: string; errors: string[]; createdAt: string }>;
+  } | null;
   createdAt: string;
   updatedAt: string;
   input: {
@@ -146,6 +152,7 @@ function statusCopy(status: string) {
     post_processing: { eyebrow: "最后装配", title: "正在完成声音、字幕与节奏", detail: "配音、环境声、版权安全音乐和字幕统一完成后进入终检。" },
     final_checking: { eyebrow: "最终检查", title: "离交付只差最后一道门", detail: "验证成片规格、音画同步、黑帧与文件完整性。" },
     awaiting_review: { eyebrow: "等待你的确认", title: "制作已安全暂停", detail: "请检查当前内容；只有你确认后，系统才会继续调用下游模型。" },
+    needs_action: { eyebrow: "需要你的操作", title: "参考解析已保留，创意融合需要重试", detail: "系统不会重新上传或解析视频；确认后只重新执行创意融合。" },
     failed: { eyebrow: "任务已停止", title: "制作过程遇到错误", detail: "后续步骤已经停止，请查看右侧实时输出和错误说明。" },
     cancelled: { eyebrow: "任务已结束", title: "这次制作已被取消", detail: "系统不会继续调用模型或生成视频。" },
   };
@@ -527,6 +534,22 @@ export function Studio({ view = "references", projectId }: { view?: StudioView; 
     }
   }
 
+  async function retryCreativeOnly() {
+    if (!project || !["needs_action", "failed"].includes(project.status) || !["creative_recovery", "synthesizing"].includes(project.pipelinePhase ?? "")) return;
+    setSubmitting(true);
+    setMessage("");
+    try {
+      const response = await fetch(`/api/projects/${project.id}/retry-creative`, { method: "POST" });
+      const data = await response.json().catch(() => null) as { project?: Project; error?: string } | null;
+      if (!response.ok || !data?.project) throw new Error(data?.error ?? "无法重新启动创意融合");
+      setProject(data.project);
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "创意融合重试失败");
+    } finally {
+      setSubmitting(false);
+    }
+  }
+
   function resetProduction() {
     setProject(null);
     setIsPlaying(true);
@@ -568,7 +591,12 @@ export function Studio({ view = "references", projectId }: { view?: StudioView; 
   const priorityCount = references.filter((item) => item.priority).length;
   const referencesReady = references.length > 0 && references.every((item) => item.status === "ready");
   const referencesProcessing = references.some((item) => item.status === "pending" || item.status === "processing");
-  const isStopped = Boolean(project && ["failed", "cancelled"].includes(project.status));
+  const needsCreativeRecovery = Boolean(project && (
+    (project.status === "needs_action" && project.pipelinePhase === "creative_recovery")
+    || (project.status === "failed" && project.pipelinePhase === "synthesizing" && project.error?.code === "ArkPipelineError")
+  ));
+  const isStopped = Boolean(project && ["failed", "cancelled"].includes(project.status) && !needsCreativeRecovery);
+  const isPaused = isStopped || needsCreativeRecovery;
   const currentProcessIndex = project?.status === "completed" ? processSteps.length : Math.max(0, processSteps.findIndex((step) => (project?.progress ?? 0) < step.end));
   const processDoneCount = project?.status === "completed" ? processSteps.length : currentProcessIndex;
   const currentCopy = project ? statusCopy(project.status) : statusCopy("ingesting");
@@ -601,7 +629,7 @@ export function Studio({ view = "references", projectId }: { view?: StudioView; 
   }
 
   if (view === "progress" && project) {
-    const activity = project.activity?.length ? project.activity : [{ id: "current", phase: project.pipelinePhase ?? project.status, message: currentCopy.detail, createdAt: project.updatedAt, level: isStopped ? "error" as const : "info" as const }];
+    const activity = project.activity?.length ? project.activity : [{ id: "current", phase: project.pipelinePhase ?? project.status, message: currentCopy.detail, createdAt: project.updatedAt, level: isPaused ? "error" as const : "info" as const }];
     return (
       <main className="studio-shell progress-shell">
         <Topbar system={system} compact />
@@ -609,19 +637,20 @@ export function Studio({ view = "references", projectId }: { view?: StudioView; 
           <div>
             <button className="text-button" onClick={() => router.push("/")}>← 返回制片单</button>
             <p className="eyebrow">任务 {project.id.slice(0, 8).toUpperCase()}</p>
-            <h1>{isStopped ? project.status === "cancelled" ? "任务已结束" : "制作已停止" : "正在制作视频"}</h1>
-            <p>{isStopped ? "系统已停止后续步骤，请查看错误并重新输入。" : "任务会在后台继续运行，你可以安全离开此页面。"}</p>
+            <h1>{needsCreativeRecovery ? "创意融合需要重新处理" : isStopped ? project.status === "cancelled" ? "任务已结束" : "制作已停止" : "正在制作视频"}</h1>
+            <p>{needsCreativeRecovery ? `${project.input.references.length}条参考视频解析已经保留；重试不会重新上传或重新解析素材。` : isStopped ? "系统已停止后续步骤，请查看错误并重新输入。" : "任务会在后台继续运行，你可以安全离开此页面。"}</p>
           </div>
-          <div className={`run-chip ${isStopped ? "stopped" : ""}`}><span className="live-dot" /> {isStopped ? "任务已停止" : project.runMode === "demo" ? "演示管线" : "生产管线"}</div>
+          <div className={`run-chip ${isPaused ? "stopped" : ""}`}><span className="live-dot" /> {needsCreativeRecovery ? "等待重试" : isStopped ? "任务已停止" : project.runMode === "demo" ? "演示管线" : "生产管线"}</div>
         </section>
 
         {isStopped && <section className="run-error wrap" role="alert"><div><span>{project.status === "cancelled" ? "CANCELLED" : "FAILED"}</span><strong>{project.error?.message || (project.status === "cancelled" ? "任务已由用户结束" : "制作过程中发生错误")}</strong><p>不会继续执行任何后续模型任务。请重新检查素材、链接或创作要求后再提交。</p></div><button onClick={() => router.push("/")}>重新输入并创建新任务 →</button></section>}
+        {needsCreativeRecovery && <section className="run-error recovery-error wrap" role="alert"><div><span>CREATIVE RECOVERY</span><strong>{project.error?.message || project.recovery?.message || "创意融合没有通过结构校验"}</strong><p>单条视频解析结果不会丢失；系统将只重试创意融合，最多执行“同模型修复 + 备用模型”三层兜底。</p>{message && <p className="recovery-message">{message}</p>}{project.recovery?.attempts?.length ? <details className="recovery-attempts"><summary>查看模型与字段错误</summary>{project.recovery.attempts.map((attempt, index) => <div key={`${attempt.createdAt}-${index}`}><b>{attempt.model}</b><span>{attempt.strategy} · {attempt.status}</span>{attempt.errors.slice(0, 5).map((error) => <code key={error}>{error}</code>)}</div>)}</details> : null}</div><button disabled={submitting} onClick={() => void retryCreativeOnly()}>{submitting ? "正在恢复融合…" : "仅重试创意融合 →"}</button></section>}
 
         <section className="monitor-grid wrap">
           <aside className="stage-rail" aria-label="制作阶段">
             <div className="section-kicker">制作轨道</div>
             {processSteps.map((stage, index) => {
-              const state = index < currentProcessIndex ? "done" : index === currentProcessIndex ? isStopped ? "failed" : "active" : "pending";
+              const state = index < currentProcessIndex ? "done" : index === currentProcessIndex ? isPaused ? "failed" : "active" : "pending";
               return (
                 <div className={`stage-item ${state}`} key={stage.key}>
                   <span className="stage-index">{state === "done" ? "✓" : state === "failed" ? "!" : String(index + 1).padStart(2, "0")}</span>
@@ -657,16 +686,16 @@ export function Studio({ view = "references", projectId }: { view?: StudioView; 
               <div><dt>平台成本</dt><dd>{project.runMode === "demo" ? "￥0.00" : "计算中"}</dd></div>
             </dl>
             <div className="status-note">
-              <span className="note-mark">{isStopped ? "!" : project.status === "quality_checking" ? "↻" : "i"}</span>
-              <p>{isStopped ? "任务已经终止，不会继续执行后续模型步骤。请返回重新检查输入后创建新任务。" : project.status === "quality_checking" ? "正在做交付前硬质检；主题跑偏、主体漂移或命中禁项都会停止交付。" : "现在不需要操作。制作完成后会自动进入交付页。"}</p>
-            </div>
-            <div className="live-stream" aria-live="polite">
-              <div className="stream-head"><span>实时输出</span><i>{isStopped ? "STOPPED" : "LIVE"}</i></div>
-              <div className="stream-lines">
-                {activity.slice(-10).map((event) => <div className={`stream-line ${event.level ?? "info"}`} key={event.id}><time>{new Date(event.createdAt).toLocaleTimeString("zh-CN", { hour12: false, hour: "2-digit", minute: "2-digit", second: "2-digit" })}</time><p>{event.message}</p></div>)}
-                {!isStopped && <div className="stream-cursor"><span />等待下一条状态更新</div>}
-              </div>
-            </div>
+               <span className="note-mark">{isPaused ? "!" : project.status === "quality_checking" ? "↻" : "i"}</span>
+               <p>{needsCreativeRecovery ? "参考解析已安全保留。点击上方按钮后，只会重试创意融合，不会重复产生视频解析费用。" : isStopped ? "任务已经终止，不会继续执行后续模型步骤。请返回重新检查输入后创建新任务。" : project.status === "quality_checking" ? "正在做交付前硬质检；主题跑偏、主体漂移或命中禁项都会停止交付。" : "现在不需要操作。制作完成后会自动进入交付页。"}</p>
+             </div>
+             <div className="live-stream" aria-live="polite">
+               <div className="stream-head"><span>实时输出</span><i>{needsCreativeRecovery ? "PAUSED" : isStopped ? "STOPPED" : "LIVE"}</i></div>
+               <div className="stream-lines">
+                 {activity.slice(-10).map((event) => <div className={`stream-line ${event.level ?? "info"}`} key={event.id}><time>{new Date(event.createdAt).toLocaleTimeString("zh-CN", { hour12: false, hour: "2-digit", minute: "2-digit", second: "2-digit" })}</time><p>{event.message}</p></div>)}
+                 {!isPaused && <div className="stream-cursor"><span />等待下一条状态更新</div>}
+               </div>
+             </div>
             <details className="diagnostics">
               <summary>管理员诊断</summary>
               <div><span>生成模型</span><strong>{modelLabel}</strong></div>
@@ -676,7 +705,7 @@ export function Studio({ view = "references", projectId }: { view?: StudioView; 
           </aside>
         </section>
 
-        {!isStopped && <section className="contact-sheet wrap">
+        {!isPaused && <section className="contact-sheet wrap">
           <div className="contact-title"><span>SHOT CONTACT SHEET</span><span>{shotsDone}/{shotTotal} READY</span></div>
           <div className="shot-strip">
             {Array.from({ length: shotTotal }).map((_, index) => {

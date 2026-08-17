@@ -37,7 +37,8 @@ npm test
 - `ARK_API_KEY`（必填，仅服务端 Secret）
 - `ARK_ANALYSIS_MODEL`（可选，默认 `doubao-seed-2-0-lite-260428`）
 - `ARK_REVIEW_MODEL`（可选，默认 `doubao-seed-2-1-pro-260628`）
+- `ARK_CREATIVE_FALLBACK_MODELS`（可选，使用英文逗号分隔备用模型或 Endpoint ID；未配置时回退到解析模型）
 - `ARK_IMAGE_MODEL`（可选，默认 `doubao-seedream-5-0-lite-260128`）
 - `ARK_VIDEO_MODEL`（可选，默认 `doubao-seedance-2-0-260128`）
 
-真实模式会把上传的视频流式送入方舟 Files API，由视觉模型逐条解析，使用复核模型收敛一个原创创意，再异步提交 Seedance 2.0 Standard。成片成功后立即归档到 R2，并按方舟返回的 token 用量回填平台成本。
+真实模式会把上传的视频流式送入方舟 Files API，由视觉模型逐条解析。创意融合通过 Function Calling 输出 `creative_card.v1`，依次执行本地结构/时间轴/来源/约束校验、同模型定向修复和备用模型重试；最终仍失败时保留解析结果，允许只重试创意融合。用户确认分镜后再异步提交 Seedance 2.0 Standard。成片成功后立即归档到 R2，并按方舟返回的 token 用量回填平台成本。

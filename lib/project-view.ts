@@ -35,6 +35,16 @@ export function presentProject(row: typeof projects.$inferSelect) {
       canvas: pipeline.canvas ?? null,
       approvals: pipeline.approvals ?? {},
     } : null,
+    recovery: pipeline?.creativeRecovery ? {
+      ...pipeline.creativeRecovery,
+      attempts: (pipeline.creativeAttempts ?? []).slice(-3).map((attempt) => ({
+        model: attempt.model,
+        strategy: attempt.strategy,
+        status: attempt.status,
+        errors: attempt.errors,
+        createdAt: attempt.createdAt,
+      })),
+    } : null,
     activity: pipeline?.events ?? [],
     error: row.errorJson ? JSON.parse(row.errorJson) : null,
     createdAt: row.runStartedAt ?? row.createdAt,

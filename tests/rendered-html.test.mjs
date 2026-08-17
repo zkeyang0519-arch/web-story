@@ -59,3 +59,21 @@ test("keeps every paid generation stage behind the three review gates", async ()
   assert.match(referenceInspector, /REFERENCE_VIDEO_UNAVAILABLE/);
   assert.match(cost, /storyboard: \{ count: number/);
 });
+
+test("recovers creative fusion without repeating video analysis", async () => {
+  const [pipeline, projectRoute, retryRoute, studio] = await Promise.all([
+    readFile(new URL("../lib/pipeline.ts", import.meta.url), "utf8"),
+    readFile(new URL("../app/api/projects/[id]/route.ts", import.meta.url), "utf8"),
+    readFile(new URL("../app/api/projects/[id]/retry-creative/route.ts", import.meta.url), "utf8"),
+    readFile(new URL("../app/studio.tsx", import.meta.url), "utf8"),
+  ]);
+  assert.match(pipeline, /submit_creative_card/);
+  assert.match(pipeline, /additionalProperties: false/);
+  assert.match(pipeline, /creative_card\.v1/);
+  assert.match(pipeline, /strategy: "repair"/);
+  assert.match(pipeline, /strategy: "fallback"/);
+  assert.match(pipeline, /CreativeStructureInvalid/);
+  assert.match(projectRoute, /"needs_action"/);
+  assert.match(retryRoute, /retryCreativeSynthesis/);
+  assert.match(studio, /仅重试创意融合/);
+});

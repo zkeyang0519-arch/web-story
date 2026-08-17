@@ -26,7 +26,7 @@ export async function GET(request: Request, context: { params: Promise<{ id: str
     const [row] = await db.select().from(projects).where(and(eq(projects.id, id), eq(projects.ownerId, ownerId(request)))).limit(1);
     if (!row) return Response.json({ error: "任务不存在" }, { status: 404 });
 
-    if (!["draft", "awaiting_review", "completed", "failed", "cancelled"].includes(row.status)) {
+    if (!["draft", "awaiting_review", "needs_action", "completed", "failed", "cancelled"].includes(row.status)) {
       const pipelineState = row.pipelineJson ? JSON.parse(row.pipelineJson) as ArkPipelineState & { _lock?: { token: string; until: number } } : null;
       if (pipelineState?._lock && pipelineState._lock.until > Date.now()) return Response.json({ project: presentProject(row) });
       const unlockedState = pipelineState ? { ...pipelineState } : null;

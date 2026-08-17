@@ -23,6 +23,7 @@ type PipelineBindings = {
   ARK_API_KEY?: string;
   ARK_ANALYSIS_MODEL?: string;
   ARK_REVIEW_MODEL?: string;
+  ARK_CREATIVE_FALLBACK_MODELS?: string;
   ARK_IMAGE_MODEL?: string;
   ARK_VIDEO_MODEL?: string;
   MEDIA?: R2Bucket;
@@ -47,6 +48,8 @@ export type PipelineInput = {
 };
 
 export type CreativeCard = {
+  schema_version?: "creative_card.v1";
+  brief_topic?: string;
   theme?: string;
   concept?: string;
   hook?: string;
@@ -56,6 +59,18 @@ export type CreativeCard = {
   audio_plan?: string;
   seedance_prompt?: string;
   quality_risks?: string[];
+  source_trace?: Array<{ source_index: number; adopted_elements: string[] }>;
+  constraint_trace?: { must_include: string[]; must_avoid: string[] };
+};
+
+export type CreativeAttempt = {
+  model: string;
+  strategy: "primary" | "repair" | "fallback";
+  status: "accepted" | "invalid" | "request_error";
+  errors: string[];
+  createdAt: string;
+  responseStatus?: string;
+  rawExcerpt?: string;
 };
 
 export type StoryboardFrame = {
@@ -112,6 +127,7 @@ export type ArkPipelineState = {
     | "ingesting"
     | "waiting_file"
     | "synthesizing"
+    | "creative_recovery"
     | "awaiting_creative_review"
     | "planning_images"
     | "awaiting_image_plan"
@@ -126,6 +142,12 @@ export type ArkPipelineState = {
   analyses: Array<Record<string, unknown>>;
   currentFileId?: string;
   creative?: CreativeCard;
+  creativeAttempts?: CreativeAttempt[];
+  creativeRecovery?: {
+    retryable: true;
+    failedAt: string;
+    message: string;
+  };
   imagePlan?: ImagePlan;
   storyboardImages?: StoryboardImage[];
   imageQuality?: QualityReport;
@@ -155,13 +177,38 @@ export type PipelineSnapshot = {
     concept?: string;
     hook?: string;
   } | null;
-  error?: { code: string; message: string } | null;
+  error?: {
+    code: string;
+    message: string;
+    recoverable?: boolean;
+    stage?: string;
+    model?: string;
+    attempts?: number;
+  } | null;
 };
 
 type ArkResponse = {
+  id?: string;
   status?: string;
-  output?: Array<{ type?: string; content?: Array<{ type?: string; text?: string }> }>;
+  incomplete_details?: { reason?: string };
+  output?: Array<{
+    type?: string;
+    name?: string;
+    arguments?: string | Record<string, unknown>;
+    status?: string;
+    content?: Array<{ type?: string; text?: string }>;
+  }>;
 };
+
+class CreativeSynthesisFailure extends Error {
+  attempts: CreativeAttempt[];
+
+  constructor(message: string, attempts: CreativeAttempt[]) {
+    super(message);
+    this.name = "CreativeSynthesisFailure";
+    this.attempts = attempts;
+  }
+}
 
 type ArkFile = { id: string; status?: string; error?: { code?: string; message?: string } };
 type ArkVideoTask = {
@@ -185,10 +232,17 @@ function bindings() {
 function arkConfig() {
   const config = bindings();
   if (!config.ARK_API_KEY) throw new Error("火山方舟 API Key 尚未配置");
+  const analysisModel = config.ARK_ANALYSIS_MODEL || "doubao-seed-2-0-lite-260428";
+  const reviewModel = config.ARK_REVIEW_MODEL || "doubao-seed-2-1-pro-260628";
+  const configuredFallbacks = (config.ARK_CREATIVE_FALLBACK_MODELS ?? "")
+    .split(",")
+    .map((model) => model.trim())
+    .filter(Boolean);
   return {
     apiKey: config.ARK_API_KEY,
-    analysisModel: config.ARK_ANALYSIS_MODEL || "doubao-seed-2-0-lite-260428",
-    reviewModel: config.ARK_REVIEW_MODEL || "doubao-seed-2-1-pro-260628",
+    analysisModel,
+    reviewModel,
+    creativeFallbackModels: configuredFallbacks.length ? configuredFallbacks : [analysisModel],
     imageModel: config.ARK_IMAGE_MODEL || "doubao-seedream-5-0-lite-260128",
     videoModel: config.ARK_VIDEO_MODEL || "doubao-seedance-2-0-260128",
   };
@@ -238,6 +292,34 @@ export async function readPipeline(args: {
   try {
     return await advanceArkPipeline(args.input, args.state, args.ownerId);
   } catch (error) {
+    if (error instanceof CreativeSynthesisFailure) {
+      const attempts = [...(args.state.creativeAttempts ?? []), ...error.attempts];
+      const message = "创意融合连续未通过结构校验；已保留全部参考视频解析，可仅重试创意融合";
+      const recoveryState = withEvent({
+        ...args.state,
+        phase: "creative_recovery",
+        currentFileId: undefined,
+        creativeAttempts: attempts,
+        creativeRecovery: {
+          retryable: true,
+          failedAt: new Date().toISOString(),
+          message,
+        },
+      }, "creative_recovery", `${message}（已尝试 ${error.attempts.length} 次）`, "error");
+      return {
+        status: "needs_action",
+        progress: 34,
+        state: recoveryState,
+        error: {
+          code: "CreativeStructureInvalid",
+          message,
+          recoverable: true,
+          stage: "creative_synthesis",
+          model: error.attempts.at(-1)?.model ?? arkConfig().reviewModel,
+          attempts: error.attempts.length,
+        },
+      };
+    }
     const message = error instanceof Error ? error.message : "火山方舟调用失败";
     if (args.state.taskId) await cancelArkTask(args.state.taskId);
     return failure("ArkPipelineError", message, args.state);
@@ -291,12 +373,24 @@ async function advanceArkPipeline(input: PipelineInput, state: ArkPipelineState,
   }
 
   if (state.phase === "synthesizing") {
-    const creative = await synthesizeCreative(input, state.analyses);
+    const synthesis = await synthesizeCreative(input, state.analyses);
     return {
       status: "awaiting_review",
       progress: 38,
-      state: withEvent({ ...state, revision: (state.revision ?? 1) + 1, phase: "awaiting_creative_review", creative, currentFileId: undefined }, "creative_review", `参考解析与融合创意已完成，等待你确认：${creative.theme || creative.concept || "原创短视频方案"}`, "success"),
+      state: withEvent({
+        ...state,
+        revision: (state.revision ?? 1) + 1,
+        phase: "awaiting_creative_review",
+        creative: synthesis.creative,
+        creativeAttempts: [...(state.creativeAttempts ?? []), ...synthesis.attempts],
+        creativeRecovery: undefined,
+        currentFileId: undefined,
+      }, "creative_review", `参考解析与融合创意已完成，等待你确认：${synthesis.creative.theme || synthesis.creative.concept || "原创短视频方案"}`, "success"),
     };
+  }
+
+  if (state.phase === "creative_recovery") {
+    return { status: "needs_action", progress: 34, state };
   }
 
   if (state.phase === "awaiting_creative_review" || state.phase === "awaiting_image_plan" || state.phase === "awaiting_canvas_review") {
@@ -450,6 +544,27 @@ export function approvePipelineGate(args: {
   };
 }
 
+export function retryCreativeSynthesis(state: ArkPipelineState): PipelineSnapshot {
+  const recoverableState = state.phase === "creative_recovery" && state.creativeRecovery?.retryable;
+  const legacySynthesisFailure = state.phase === "synthesizing" && state.analyses.length > 0;
+  if (!recoverableState && !legacySynthesisFailure) {
+    throw new Error("当前任务没有可重试的创意融合步骤");
+  }
+  if (!state.analyses.length) throw new Error("参考视频解析结果缺失，无法单独重试创意融合");
+  return {
+    status: "analyzing",
+    progress: 32,
+    state: withEvent({
+      ...state,
+      revision: (state.revision ?? 1) + 1,
+      phase: "synthesizing",
+      creative: undefined,
+      creativeRecovery: undefined,
+      currentFileId: undefined,
+    }, "creative_retry", `已保留 ${state.analyses.length} 条参考解析，仅重新执行创意融合`, "info"),
+  };
+}
+
 function nextReferenceState(input: PipelineInput, state: ArkPipelineState, analysis: Record<string, unknown>): PipelineSnapshot {
   const nextIndex = state.referenceIndex + 1;
   return {
@@ -534,22 +649,195 @@ async function analyzeReference(source: { fileId?: string; videoUrl?: string }, 
   return normalizeReferenceAnalysis(parsed, index, reference);
 }
 
-async function synthesizeCreative(input: PipelineInput, analyses: Array<Record<string, unknown>>): Promise<CreativeCard> {
-  const prompt = `你是资深短视频创意总监。根据用户简报和多条参考视频的结构化解析，比较、筛选并融合创意，最终只给出一个最适合生产的原创方案。
-要求：前2秒有强钩子；9:16竖屏；总时长15秒；镜头可由 Seedance 2.0 稳定生成；主体、场景、光线连续；不要照搬参考视频；避免复杂文字、多人交互和高失败率动作。
-用户简报：${JSON.stringify({ topicMode: input.topicMode, topic: input.topic, goal: input.goal, audience: input.audience, platform: input.platform, style: input.style, company: input.company, mustInclude: input.mustInclude, mustAvoid: input.mustAvoid, cta: input.cta })}
-参考解析：${JSON.stringify(analyses)}
-只输出 JSON 对象，字段必须包括：theme、concept、hook、story_arc、shot_plan、visual_style、audio_plan、seedance_prompt、quality_risks。seedance_prompt 必须是可直接用于生成完整15秒中文视频的高密度提示词，写清时间轴、镜头、主体、环境、动作、光线、声音和一致性约束。`;
-  const response = await arkRequest<ArkResponse>("/responses", {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({
-      model: arkConfig().reviewModel,
-      input: prompt,
-      max_output_tokens: 2600,
-    }),
-  });
-  return normalizeCreativeCard(parseModelJson(responseText(response)));
+const CREATIVE_TOOL_NAME = "submit_creative_card";
+const CREATIVE_TOOL = {
+  type: "function",
+  name: CREATIVE_TOOL_NAME,
+  description: "提交唯一、可拍摄、可追溯到参考素材的15秒短视频创意卡",
+  parameters: {
+    type: "object",
+    additionalProperties: false,
+    required: [
+      "schema_version", "brief_topic", "theme", "concept", "hook", "story_arc", "shot_plan",
+      "visual_style", "audio_plan", "quality_risks", "source_trace", "constraint_trace",
+    ],
+    properties: {
+      schema_version: { type: "string", enum: ["creative_card.v1"] },
+      brief_topic: { type: "string", description: "用户手动主题必须原样填写；AI主题模式则填写最终选定主题" },
+      theme: { type: "string" },
+      concept: { type: "string" },
+      hook: { type: "string", description: "前2秒可以被直接拍摄或生成的视觉钩子" },
+      story_arc: { type: "string" },
+      shot_plan: {
+        type: "array",
+        minItems: 4,
+        maxItems: 4,
+        items: {
+          type: "object",
+          additionalProperties: false,
+          required: ["order", "start_ms", "end_ms", "scene", "action", "camera", "audio", "source_indices"],
+          properties: {
+            order: { type: "integer", minimum: 1, maximum: 4 },
+            start_ms: { type: "integer", minimum: 0, maximum: 14999 },
+            end_ms: { type: "integer", minimum: 1, maximum: 15000 },
+            scene: { type: "string" },
+            action: { type: "string" },
+            camera: { type: "string" },
+            audio: { type: "string" },
+            source_indices: { type: "array", items: { type: "integer", minimum: 1 }, uniqueItems: true },
+          },
+        },
+      },
+      visual_style: { type: "string" },
+      audio_plan: { type: "string" },
+      quality_risks: { type: "array", items: { type: "string" } },
+      source_trace: {
+        type: "array",
+        items: {
+          type: "object",
+          additionalProperties: false,
+          required: ["source_index", "adopted_elements"],
+          properties: {
+            source_index: { type: "integer", minimum: 1 },
+            adopted_elements: { type: "array", minItems: 1, items: { type: "string" } },
+          },
+        },
+      },
+      constraint_trace: {
+        type: "object",
+        additionalProperties: false,
+        required: ["must_include", "must_avoid"],
+        properties: {
+          must_include: { type: "array", items: { type: "string" } },
+          must_avoid: { type: "array", items: { type: "string" } },
+        },
+      },
+    },
+  },
+} as const;
+
+async function synthesizeCreative(input: PipelineInput, analyses: Array<Record<string, unknown>>) {
+  const config = arkConfig();
+  const fallbackModel = config.creativeFallbackModels.find((model) => model !== config.reviewModel) ?? config.analysisModel;
+  const attemptPlan: Array<{ model: string; strategy: CreativeAttempt["strategy"] }> = [
+    { model: config.reviewModel, strategy: "primary" },
+    { model: config.reviewModel, strategy: "repair" },
+    { model: fallbackModel, strategy: "fallback" },
+  ];
+  const attempts: CreativeAttempt[] = [];
+  let previousRaw = "";
+  let previousErrors: string[] = [];
+
+  for (const attempt of attemptPlan) {
+    const createdAt = new Date().toISOString();
+    try {
+      const response = await arkRequest<ArkResponse>("/responses", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          model: attempt.model,
+          input: creativeSynthesisPrompt(input, analyses, attempt.strategy === "repair" ? { raw: previousRaw, errors: previousErrors } : undefined),
+          tools: [CREATIVE_TOOL],
+          max_output_tokens: 5000,
+          thinking: { type: "disabled" },
+        }),
+      });
+      const extracted = extractCreativeCandidate(response);
+      previousRaw = extracted.raw;
+      const validated = extracted.value
+        ? validateGeneratedCreativeCard(extracted.value, input, analyses.length)
+        : { errors: extracted.errors };
+      previousErrors = validated.errors;
+      if ("creative" in validated && validated.creative) {
+        attempts.push({
+          model: attempt.model,
+          strategy: attempt.strategy,
+          status: "accepted",
+          errors: [],
+          createdAt,
+          responseStatus: response.status,
+        });
+        return { creative: validated.creative, attempts };
+      }
+      attempts.push({
+        model: attempt.model,
+        strategy: attempt.strategy,
+        status: "invalid",
+        errors: previousErrors.slice(0, 20),
+        createdAt,
+        responseStatus: response.status,
+        rawExcerpt: clipText(previousRaw, 4000),
+      });
+    } catch (error) {
+      previousErrors = [error instanceof Error ? error.message : "创意融合请求失败"];
+      attempts.push({
+        model: attempt.model,
+        strategy: attempt.strategy,
+        status: "request_error",
+        errors: previousErrors,
+        createdAt,
+      });
+    }
+  }
+
+  throw new CreativeSynthesisFailure("创意融合模型连续未返回符合 creative_card.v1 的结果", attempts);
+}
+
+function creativeSynthesisPrompt(
+  input: PipelineInput,
+  analyses: Array<Record<string, unknown>>,
+  repair?: { raw: string; errors: string[] },
+) {
+  const compactAnalyses = analyses.map((analysis) => ({
+    source_index: analysis.source_index,
+    source_name: analysis.source_name,
+    summary: analysis.summary,
+    hook: analysis.hook,
+    creative_mechanism: analysis.creative_mechanism,
+    visual_grammar: analysis.visual_grammar,
+    camera_and_motion: analysis.camera_and_motion,
+    pacing: analysis.pacing,
+    audio_design: analysis.audio_design,
+    emotion_curve: analysis.emotion_curve,
+    reusable_techniques: analysis.reusable_techniques,
+    quality_risks: analysis.quality_risks,
+    confidence: analysis.confidence,
+    priority: analysis.priority,
+  }));
+  const brief = {
+    topicMode: input.topicMode,
+    topic: input.topic,
+    goal: input.goal,
+    audience: input.audience,
+    platform: input.platform,
+    duration: input.duration,
+    ratio: input.ratio,
+    style: input.style,
+    company: input.company,
+    mustInclude: input.mustInclude,
+    mustAvoid: input.mustAvoid,
+    cta: input.cta,
+  };
+  const repairBlock = repair
+    ? `\n上一次返回没有通过校验。只修复列出的错误，不得改变用户主题或明确约束。\n校验错误：${JSON.stringify(repair.errors)}\n上一次返回：${clipText(repair.raw, 8000)}`
+    : "";
+  return `你是资深短视频创意总监。比较、筛选并融合参考视频中可迁移的创意机制，只形成一个原创方案。你必须调用 ${CREATIVE_TOOL_NAME}，不得输出普通文本或 Markdown。
+硬要求：前2秒有明确视觉钩子；9:16竖屏；总时长严格${input.duration}秒；恰好4个连续镜头，时间轴从0毫秒连续覆盖到${input.duration * 1000}毫秒；主体、场景、光线连续；动作必须能由 Seedance 2.0 稳定生成；不照搬参考人物、品牌、原台词或受保护表达。用户为手动主题时，brief_topic 必须逐字等于用户主题。存在多条有效参考时，source_trace 至少采用2个不同来源。constraint_trace 必须逐项原样列出用户的必备和禁用内容。不要在这一步编写 Seedance 最终提示词。
+用户简报：${JSON.stringify(brief)}
+参考解析：${JSON.stringify(compactAnalyses)}${repairBlock}`;
+}
+
+function extractCreativeCandidate(response: ArkResponse): { raw: string; value?: Record<string, unknown>; errors: string[] } {
+  if (response.status && response.status !== "completed") {
+    return { raw: "", errors: [`响应状态不是 completed：${response.status}${response.incomplete_details?.reason ? `（${response.incomplete_details.reason}）` : ""}`] };
+  }
+  const call = (response.output ?? []).find((item) => item.type === "function_call" && item.name === CREATIVE_TOOL_NAME);
+  const raw = call
+    ? typeof call.arguments === "string" ? call.arguments : JSON.stringify(call.arguments ?? {})
+    : responseText(response);
+  if (!raw.trim()) return { raw, errors: [`模型没有调用 ${CREATIVE_TOOL_NAME}，也没有返回可解析内容`] };
+  const parsed = tryParseModelJson(raw);
+  return parsed.value ? { raw, value: parsed.value, errors: [] } : { raw, errors: [parsed.error ?? "返回内容不是合法 JSON"] };
 }
 
 async function planStoryboardImages(input: PipelineInput, creative: CreativeCard, analyses: Array<Record<string, unknown>>): Promise<ImagePlan> {
@@ -806,7 +1094,19 @@ function normalizeCreativeCard(value: unknown): CreativeCard {
   const source = objectValue(value);
   const shotPlan = Array.isArray(source.shot_plan) ? source.shot_plan.slice(0, 12).map((item) => typeof item === "string" ? { description: item } : objectValue(item)) : [];
   if (shotPlan.length < 3) throw new Error("融合创意至少需要3个可执行镜头");
+  const sourceTrace = Array.isArray(source.source_trace) ? source.source_trace.map((item) => {
+    const trace = objectValue(item);
+    return {
+      source_index: Number(trace.source_index),
+      adopted_elements: textList(trace.adopted_elements),
+    };
+  }) : undefined;
+  const constraintSource = source.constraint_trace && typeof source.constraint_trace === "object" && !Array.isArray(source.constraint_trace)
+    ? source.constraint_trace as Record<string, unknown>
+    : null;
   return {
+    schema_version: source.schema_version === "creative_card.v1" ? "creative_card.v1" : undefined,
+    brief_topic: optionalText(source.brief_topic, 300),
     theme: textValue(source.theme, "创意主题", 300),
     concept: textValue(source.concept, "一句话创意", 1200),
     hook: textValue(source.hook, "前2秒钩子", 600),
@@ -816,7 +1116,134 @@ function normalizeCreativeCard(value: unknown): CreativeCard {
     audio_plan: textValue(source.audio_plan, "声音方案", 1200),
     seedance_prompt: optionalText(source.seedance_prompt, 6000),
     quality_risks: textList(source.quality_risks),
+    source_trace: sourceTrace,
+    constraint_trace: constraintSource ? {
+      must_include: textList(constraintSource.must_include),
+      must_avoid: textList(constraintSource.must_avoid),
+    } : undefined,
   };
+}
+
+function validateGeneratedCreativeCard(
+  value: unknown,
+  input: PipelineInput,
+  analysisCount: number,
+): { creative?: CreativeCard; errors: string[] } {
+  const errors: string[] = [];
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return { errors: ["/: 必须是 JSON 对象"] };
+  }
+  const source = value as Record<string, unknown>;
+  const allowedTop = new Set([
+    "schema_version", "brief_topic", "theme", "concept", "hook", "story_arc", "shot_plan",
+    "visual_style", "audio_plan", "quality_risks", "source_trace", "constraint_trace",
+  ]);
+  for (const key of Object.keys(source)) if (!allowedTop.has(key)) errors.push(`/${key}: 不允许的额外字段`);
+
+  const requiredText = (key: string, max: number) => {
+    const valueAtKey = source[key];
+    if (typeof valueAtKey !== "string" || !valueAtKey.trim()) errors.push(`/${key}: 必须是非空字符串`);
+    else if (valueAtKey.trim().length > max) errors.push(`/${key}: 内容超过${max}字`);
+  };
+  if (source.schema_version !== "creative_card.v1") errors.push('/schema_version: 必须等于 "creative_card.v1"');
+  requiredText("brief_topic", 300);
+  requiredText("theme", 300);
+  requiredText("concept", 1200);
+  requiredText("hook", 600);
+  requiredText("story_arc", 2400);
+  requiredText("visual_style", 1200);
+  requiredText("audio_plan", 1200);
+  if (input.topicMode === "manual" && String(source.brief_topic ?? "").trim() !== String(input.topic ?? "").trim()) {
+    errors.push("/brief_topic: 必须逐字保留用户手动主题");
+  }
+
+  const shots = source.shot_plan;
+  if (!Array.isArray(shots) || shots.length !== 4) {
+    errors.push("/shot_plan: 必须恰好包含4个镜头");
+  } else {
+    let expectedStart = 0;
+    const shotKeys = new Set(["order", "start_ms", "end_ms", "scene", "action", "camera", "audio", "source_indices"]);
+    shots.forEach((shot, index) => {
+      const path = `/shot_plan/${index}`;
+      if (!shot || typeof shot !== "object" || Array.isArray(shot)) {
+        errors.push(`${path}: 必须是对象`);
+        return;
+      }
+      const item = shot as Record<string, unknown>;
+      for (const key of Object.keys(item)) if (!shotKeys.has(key)) errors.push(`${path}/${key}: 不允许的额外字段`);
+      if (item.order !== index + 1) errors.push(`${path}/order: 必须等于${index + 1}`);
+      const start = Number(item.start_ms);
+      const end = Number(item.end_ms);
+      if (!Number.isInteger(start) || start !== expectedStart) errors.push(`${path}/start_ms: 必须从${expectedStart}毫秒连续开始`);
+      if (!Number.isInteger(end) || end <= start || end > input.duration * 1000) errors.push(`${path}/end_ms: 必须是有效的结束毫秒数`);
+      if (Number.isInteger(end)) expectedStart = end;
+      for (const key of ["scene", "action", "camera", "audio"]) {
+        if (typeof item[key] !== "string" || !String(item[key]).trim()) errors.push(`${path}/${key}: 必须是非空字符串`);
+      }
+      if (!Array.isArray(item.source_indices) || item.source_indices.length < 1 || item.source_indices.some((entry) => !Number.isInteger(entry) || Number(entry) < 1 || Number(entry) > analysisCount)) {
+        errors.push(`${path}/source_indices: 必须引用有效的参考序号`);
+      }
+    });
+    if (expectedStart !== input.duration * 1000) errors.push(`/shot_plan: 时间轴必须连续覆盖到${input.duration * 1000}毫秒`);
+  }
+
+  if (!Array.isArray(source.quality_risks) || source.quality_risks.some((item) => typeof item !== "string" || !item.trim())) {
+    errors.push("/quality_risks: 必须是字符串数组");
+  }
+
+  const sourceTrace = source.source_trace;
+  const tracedSources = new Set<number>();
+  if (!Array.isArray(sourceTrace)) {
+    errors.push("/source_trace: 必须是数组");
+  } else {
+    const traceKeys = new Set(["source_index", "adopted_elements"]);
+    sourceTrace.forEach((trace, index) => {
+      const path = `/source_trace/${index}`;
+      if (!trace || typeof trace !== "object" || Array.isArray(trace)) {
+        errors.push(`${path}: 必须是对象`);
+        return;
+      }
+      const item = trace as Record<string, unknown>;
+      for (const key of Object.keys(item)) if (!traceKeys.has(key)) errors.push(`${path}/${key}: 不允许的额外字段`);
+      const sourceIndex = Number(item.source_index);
+      if (!Number.isInteger(sourceIndex) || sourceIndex < 1 || sourceIndex > analysisCount) errors.push(`${path}/source_index: 参考序号无效`);
+      else tracedSources.add(sourceIndex);
+      if (!Array.isArray(item.adopted_elements) || item.adopted_elements.length < 1 || item.adopted_elements.some((entry) => typeof entry !== "string" || !entry.trim())) {
+        errors.push(`${path}/adopted_elements: 至少需要一个可迁移元素`);
+      }
+    });
+    const requiredSourceCount = Math.min(2, analysisCount);
+    if (tracedSources.size < requiredSourceCount) errors.push(`/source_trace: 至少需要采用${requiredSourceCount}个不同参考来源`);
+  }
+
+  const constraintTrace = source.constraint_trace;
+  if (!constraintTrace || typeof constraintTrace !== "object" || Array.isArray(constraintTrace)) {
+    errors.push("/constraint_trace: 必须是对象");
+  } else {
+    const trace = constraintTrace as Record<string, unknown>;
+    for (const key of Object.keys(trace)) if (!new Set(["must_include", "must_avoid"]).has(key)) errors.push(`/constraint_trace/${key}: 不允许的额外字段`);
+    const includeTrace = Array.isArray(trace.must_include) ? trace.must_include.map((item) => String(item).trim()).filter(Boolean) : [];
+    const avoidTrace = Array.isArray(trace.must_avoid) ? trace.must_avoid.map((item) => String(item).trim()).filter(Boolean) : [];
+    if (!Array.isArray(trace.must_include)) errors.push("/constraint_trace/must_include: 必须是数组");
+    if (!Array.isArray(trace.must_avoid)) errors.push("/constraint_trace/must_avoid: 必须是数组");
+    for (const constraint of splitConstraints(input.mustInclude)) {
+      if (!includeTrace.includes(constraint)) errors.push(`/constraint_trace/must_include: 缺少必备内容“${constraint}”`);
+    }
+    for (const constraint of splitConstraints(input.mustAvoid)) {
+      if (!avoidTrace.includes(constraint)) errors.push(`/constraint_trace/must_avoid: 缺少禁用内容“${constraint}”`);
+    }
+  }
+
+  if (errors.length) return { errors };
+  try {
+    return { creative: normalizeCreativeCard(source), errors: [] };
+  } catch (error) {
+    return { errors: [error instanceof Error ? error.message : "创意卡规范化失败"] };
+  }
+}
+
+function splitConstraints(value?: string) {
+  return (value ?? "").split(/[，,、；;\n]/).map((item) => item.trim()).filter(Boolean);
 }
 
 function normalizeImagePlan(value: unknown): ImagePlan {
@@ -903,16 +1330,29 @@ function clipText(value: unknown, max: number) {
   return text.length <= max ? text : `${text.slice(0, Math.max(0, max - 1))}…`;
 }
 
-function parseModelJson(text: string): Record<string, unknown> {
+function tryParseModelJson(text: string): { value?: Record<string, unknown>; error?: string } {
   const cleaned = text.trim().replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/, "");
-  try { return JSON.parse(cleaned) as Record<string, unknown>; } catch {
+  try {
+    const value = JSON.parse(cleaned) as unknown;
+    if (value && typeof value === "object" && !Array.isArray(value)) return { value: value as Record<string, unknown> };
+    return { error: "返回的 JSON 顶层必须是对象" };
+  } catch {
     const start = cleaned.indexOf("{");
     const end = cleaned.lastIndexOf("}");
     if (start >= 0 && end > start) {
-      try { return JSON.parse(cleaned.slice(start, end + 1)) as Record<string, unknown>; } catch { /* fall through */ }
+      try {
+        const value = JSON.parse(cleaned.slice(start, end + 1)) as unknown;
+        if (value && typeof value === "object" && !Array.isArray(value)) return { value: value as Record<string, unknown> };
+      } catch { /* fall through */ }
     }
-    throw new Error("模型未返回合法的结构化结果，任务已停止，请重新输入后重试");
+    return { error: "返回内容不是完整、合法的 JSON 对象" };
   }
+}
+
+function parseModelJson(text: string): Record<string, unknown> {
+  const parsed = tryParseModelJson(text);
+  if (parsed.value) return parsed.value;
+  throw new Error(parsed.error ?? "模型未返回合法的结构化结果");
 }
 
 function failure(code: string, message: string, state?: ArkPipelineState): PipelineSnapshot {
@@ -920,6 +1360,7 @@ function failure(code: string, message: string, state?: ArkPipelineState): Pipel
     ingesting: 12,
     waiting_file: 18,
     synthesizing: 34,
+    creative_recovery: 34,
     awaiting_creative_review: 38,
     planning_images: 44,
     awaiting_image_plan: 48,
