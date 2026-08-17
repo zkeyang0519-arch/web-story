@@ -22,6 +22,7 @@ type PipelineBindings = {
   ARK_API_KEY?: string;
   ARK_ANALYSIS_MODEL?: string;
   ARK_REVIEW_MODEL?: string;
+  ARK_IMAGE_MODEL?: string;
   ARK_VIDEO_MODEL?: string;
   MEDIA?: R2Bucket;
 };
@@ -65,11 +66,12 @@ export type PipelineActivityEvent = {
 };
 
 export type ArkPipelineState = {
-  phase: "ingesting" | "waiting_file" | "synthesizing" | "submitting_video" | "polling_video";
+  phase: "ingesting" | "waiting_file" | "synthesizing" | "generating_keyframe" | "submitting_video" | "polling_video";
   referenceIndex: number;
   analyses: Array<Record<string, unknown>>;
   currentFileId?: string;
   creative?: CreativeCard;
+  keyframe?: { sourceUrl: string; objectKey: string; size?: string; model?: string; cost: number };
   taskId?: string;
   events?: PipelineActivityEvent[];
 };
@@ -104,6 +106,12 @@ type ArkVideoTask = {
   error?: { code?: string; message?: string };
 };
 
+type ArkImageResponse = {
+  model?: string;
+  data?: Array<{ url?: string; size?: string }>;
+  usage?: { generated_images?: number; total_tokens?: number };
+};
+
 function bindings() {
   return env as unknown as PipelineBindings;
 }
@@ -115,6 +123,7 @@ function arkConfig() {
     apiKey: config.ARK_API_KEY,
     analysisModel: config.ARK_ANALYSIS_MODEL || "doubao-seed-2-0-lite-260428",
     reviewModel: config.ARK_REVIEW_MODEL || "doubao-seed-2-1-pro-260628",
+    imageModel: config.ARK_IMAGE_MODEL || "doubao-seedream-5-0-lite-260128",
     videoModel: config.ARK_VIDEO_MODEL || "doubao-seedance-2-0-260128",
   };
 }
@@ -220,16 +229,25 @@ async function advanceArkPipeline(input: PipelineInput, state: ArkPipelineState,
     const creative = await synthesizeCreative(input, state.analyses);
     return {
       status: "generating_assets",
-      progress: 46,
-      state: withEvent({ ...state, phase: "submitting_video", creative, currentFileId: undefined }, "storyboard", `唯一创意已收敛：${creative.theme || creative.concept || "原创短视频方案"}`),
+      progress: 42,
+      state: withEvent({ ...state, phase: "generating_keyframe", creative, currentFileId: undefined }, "storyboard", `剧本与镜头计划已完成：${creative.theme || creative.concept || "原创短视频方案"}`),
+    };
+  }
+
+  if (state.phase === "generating_keyframe") {
+    const keyframe = await generateKeyframe(input, state.creative ?? {}, ownerId);
+    return {
+      status: "generating_assets",
+      progress: 57,
+      state: withEvent({ ...state, phase: "submitting_video", keyframe }, "keyframe", "Seedream 首帧关键视觉已生成并归档", "success"),
     };
   }
 
   if (state.phase === "submitting_video") {
-    const task = await createSeedanceTask(input, state.creative ?? {});
+    const task = await createSeedanceTask(input, state.creative ?? {}, state.keyframe?.sourceUrl);
     return {
       status: "generating_video",
-      progress: 55,
+      progress: 64,
       providerJobId: task.id,
       state: withEvent({ ...state, phase: "polling_video", taskId: task.id }, "seedance_submit", "Seedance 2.0 任务已提交，正在等待生成资源"),
     };
@@ -237,15 +255,15 @@ async function advanceArkPipeline(input: PipelineInput, state: ArkPipelineState,
 
   if (!state.taskId) throw new Error("Seedance 任务标识缺失");
   const task = await arkRequest<ArkVideoTask>(`/contents/generations/tasks/${encodeURIComponent(state.taskId)}`);
-  if (task.status === "queued") return { status: "generating_video", progress: 62, providerJobId: task.id, state: withEvent(state, "seedance_queue", "Seedance 正在排队，任务状态正常") };
-  if (task.status === "running") return { status: "quality_checking", progress: 78, providerJobId: task.id, state: withEvent(state, "seedance_render", "Seedance 正在渲染画面、动作与声音") };
+  if (task.status === "queued") return { status: "generating_video", progress: 68, providerJobId: task.id, state: withEvent(state, "seedance_queue", "Seedance 正在排队，任务状态正常") };
+  if (task.status === "running") return { status: "quality_checking", progress: 80, providerJobId: task.id, state: withEvent(state, "seedance_render", "Seedance 正在以关键帧为首帧渲染画面、动作与声音") };
   if (task.status !== "succeeded" || !task.content?.video_url) {
     return failure(task.error?.code || `Seedance${task.status}`, task.error?.message || `视频生成任务状态：${task.status}`, state);
   }
 
   const objectKey = await archiveVideo(input.projectId, ownerId, task.content.video_url);
   const totalTokens = task.usage?.total_tokens ?? task.usage?.completion_tokens ?? 0;
-  const actualCost = totalTokens ? Math.round((totalTokens * 46 / 1_000_000) * 10000) / 10000 : null;
+  const actualCost = totalTokens ? Math.round(((totalTokens * 46 / 1_000_000) + (state.keyframe?.cost ?? 0)) * 10000) / 10000 : null;
   return {
     status: "completed",
     progress: 100,
@@ -363,16 +381,38 @@ async function synthesizeCreative(input: PipelineInput, analyses: Array<Record<s
   return parseModelJson(responseText(response)) as CreativeCard;
 }
 
-async function createSeedanceTask(input: PipelineInput, creative: CreativeCard) {
+async function generateKeyframe(input: PipelineInput, creative: CreativeCard, ownerId: string) {
+  const prompt = `为一条15秒竖屏短视频生成首帧关键视觉。画幅9:16，电影级真实摄影，主体清晰，环境完整，光线和色彩统一，构图为后续镜头运动预留空间。不要文字、字幕、品牌标识、边框或拼图。\n创意：${creative.concept || creative.theme || input.topic || input.goal}\n开场钩子：${creative.hook || "第一眼建立强视觉吸引力"}\n视觉风格：${creative.visual_style || input.style}\n首镜头计划：${JSON.stringify(creative.shot_plan?.[0] ?? {})}`;
+  const response = await arkRequest<ArkImageResponse>("/images/generations", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      model: arkConfig().imageModel,
+      prompt,
+      size: "1440x2560",
+      sequential_image_generation: "disabled",
+      response_format: "url",
+      watermark: false,
+    }),
+  });
+  const sourceUrl = response.data?.[0]?.url;
+  if (!sourceUrl) throw new Error("Seedream 未返回可用的关键帧图片");
+  const objectKey = await archiveImage(input.projectId, ownerId, sourceUrl);
+  return { sourceUrl, objectKey, size: response.data?.[0]?.size, model: response.model ?? arkConfig().imageModel, cost: 0.22 };
+}
+
+async function createSeedanceTask(input: PipelineInput, creative: CreativeCard, keyframeUrl?: string) {
   const prompt = creative.seedance_prompt || `${creative.hook || "强视觉钩子"}。${creative.concept || input.topic || input.goal}。${creative.visual_style || input.style}。15秒，9:16竖屏，主体一致，镜头运动自然，画面真实清晰。`;
+  const content: Array<Record<string, unknown>> = [{ type: "text", text: prompt }];
+  if (keyframeUrl) content.push({ type: "image_url", image_url: { url: keyframeUrl }, role: "first_frame" });
   return arkRequest<{ id: string }>("/contents/generations/tasks", {
     method: "POST",
     headers: { "content-type": "application/json" },
     body: JSON.stringify({
       model: arkConfig().videoModel,
-      content: [{ type: "text", text: prompt }],
+      content,
       resolution: "1080p",
-      ratio: "9:16",
+      ratio: keyframeUrl ? "adaptive" : "9:16",
       duration: 15,
       generate_audio: true,
       return_last_frame: true,
@@ -381,6 +421,20 @@ async function createSeedanceTask(input: PipelineInput, creative: CreativeCard) 
       safety_identifier: `jingliu_${input.projectId.replace(/-/g, "").slice(0, 48)}`,
     }),
   });
+}
+
+async function archiveImage(projectId: string, ownerId: string, imageUrl: string) {
+  const storage = bindings().MEDIA;
+  if (!storage) throw new Error("对象存储不可用");
+  const response = await fetch(imageUrl);
+  if (!response.ok || !response.body) throw new Error(`关键帧下载失败（${response.status}）`);
+  const contentType = response.headers.get("content-type") || "image/jpeg";
+  const extension = contentType.includes("png") ? "png" : contentType.includes("webp") ? "webp" : "jpg";
+  const key = `outputs/${ownerId}/${projectId}/keyframe.${extension}`;
+  await storage.put(key, response.body, { httpMetadata: { contentType }, customMetadata: { projectId, source: "seedream-5.0-lite" } });
+  const head = await storage.head(key);
+  if (!head || head.size <= 0) throw new Error("关键帧归档校验失败");
+  return key;
 }
 
 async function archiveVideo(projectId: string, ownerId: string, videoUrl: string) {
@@ -430,7 +484,7 @@ function parseModelJson(text: string): Record<string, unknown> {
 }
 
 function failure(code: string, message: string, state?: ArkPipelineState): PipelineSnapshot {
-  const progressByPhase: Record<ArkPipelineState["phase"], number> = { ingesting: 12, waiting_file: 18, synthesizing: 38, submitting_video: 52, polling_video: 72 };
+  const progressByPhase: Record<ArkPipelineState["phase"], number> = { ingesting: 12, waiting_file: 18, synthesizing: 38, generating_keyframe: 48, submitting_video: 60, polling_video: 74 };
   return { status: "failed", progress: state ? progressByPhase[state.phase] : 0, state: state ? withEvent(state, "failed", `任务中断：${message}`, "error") : state, error: { code, message } };
 }
 

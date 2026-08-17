@@ -228,12 +228,23 @@ fieldset { padding: 0; border: 0; margin: 0; }
 .is-processing { background: #202627; }
 .is-processing::before { content: ""; position: absolute; width: 62%; height: 40%; background: #31393a; top: 18%; left: 19%; transform: skewY(-8deg); animation: slate 4.8s ease-in-out infinite; }
 .is-processing::after { content: ""; position: absolute; width: 42%; height: 20%; background: #413029; right: -4%; bottom: 12%; transform: rotate(-12deg); }
+.is-processing.has-keyframe::before, .is-processing.has-keyframe::after { display: none; }
+.keyframe-preview { position: absolute; inset: 0; z-index: 1; width: 100%; height: 100%; object-fit: cover; }
+.has-keyframe::after { content: ""; display: block !important; position: absolute; inset: 0; z-index: 2; width: auto; height: auto; background: linear-gradient(180deg, rgba(8,10,10,.22), transparent 40%, rgba(8,10,10,.84)); transform: none; }
+.keyframe-live { position: absolute; z-index: 4; top: 25%; left: 12%; right: 12%; display: grid; justify-items: center; text-align: center; }
+.keyframe-live i { width: 56px; height: 56px; border: 1px solid rgba(216,255,78,.45); box-shadow: inset 0 0 0 10px rgba(216,255,78,.05); animation: keyframeScan 1.8s ease-in-out infinite; }
+.keyframe-live span { margin-top: 16px; color: var(--signal); font: 700 8px/1 var(--mono); letter-spacing: .16em; }
+.keyframe-live strong { margin-top: 9px; font-size: 15px; }.keyframe-live small { margin-top: 8px; color: #788184; font-size: 8px; }
+@keyframes keyframeScan { 50% { transform: scale(1.14) rotate(45deg); border-color: var(--accent); } }
+.keyframe-ready { position: absolute; z-index: 5; left: 14px; top: 35px; padding: 8px 10px; background: rgba(8,10,10,.68); backdrop-filter: blur(8px); border-left: 2px solid var(--signal); }
+.keyframe-ready span, .keyframe-ready small { display: block; }.keyframe-ready span { color: var(--signal); font: 700 7px/1 var(--mono); letter-spacing: .1em; }.keyframe-ready small { margin-top: 5px; color: #c2c7c7; font-size: 7px; }
 @keyframes slate { 50% { transform: translateY(18px) skewY(5deg); opacity: .62; } }
 .monitor-topline { position: absolute; top: 14px; left: 14px; right: 14px; display: flex; justify-content: space-between; z-index: 4; color: rgba(240,238,232,.7); font: 7px ui-monospace, monospace; letter-spacing: .12em; }
 .focus-corners { position: absolute; inset: 13%; z-index: 3; }.focus-corners i { position: absolute; width: 20px; height: 20px; border-color: rgba(240,238,232,.35); }.focus-corners i:nth-child(1) { left: 0; top: 0; border-left: 1px solid; border-top: 1px solid; }.focus-corners i:nth-child(2) { right: 0; top: 0; border-right: 1px solid; border-top: 1px solid; }.focus-corners i:nth-child(3) { left: 0; bottom: 0; border-left: 1px solid; border-bottom: 1px solid; }.focus-corners i:nth-child(4) { right: 0; bottom: 0; border-right: 1px solid; border-bottom: 1px solid; }
 .processing-orbit { position: absolute; top: 30%; left: 50%; width: 110px; height: 110px; transform: translateX(-50%); z-index: 2; border: 1px solid rgba(216,255,78,.18); border-radius: 50%; animation: orbit 8s linear infinite; }.processing-orbit span { position: absolute; width: 8px; height: 8px; background: var(--signal); border-radius: 50%; }.processing-orbit span:nth-child(1) { top: -4px; left: 50%; }.processing-orbit span:nth-child(2) { right: 8px; bottom: 14px; background: var(--accent); }.processing-orbit span:nth-child(3) { left: 2px; bottom: 26px; background: #7ba0ac; }
 @keyframes orbit { to { transform: translateX(-50%) rotate(360deg); } }
 .monitor-copy { position: absolute; left: 32px; right: 32px; bottom: 70px; z-index: 4; }.monitor-copy span { color: var(--signal); font: 8px ui-monospace, monospace; letter-spacing: .12em; }.monitor-copy strong { display: block; font-size: 20px; line-height: 1.35; margin: 10px 0; }.monitor-copy p { margin: 0; color: #aeb5b6; font-size: 10px; line-height: 1.7; }
+.monitor-copy.over-keyframe strong { text-shadow: 0 2px 18px rgba(0,0,0,.65); }.monitor-copy.over-keyframe p { color: #d3d6d4; text-shadow: 0 1px 10px rgba(0,0,0,.8); }
 .monitor-timecode, .delivery-timecode { position: absolute; bottom: 14px; right: 14px; z-index: 4; font: 8px ui-monospace, monospace; color: #c4c9ca; }
 .big-progress { display: flex; align-items: baseline; gap: 8px; margin: 38px 0 14px; }.big-progress strong { font: 300 48px ui-monospace, monospace; color: var(--signal); }.big-progress span { color: #81898c; font-size: 11px; }
 .meter { height: 3px; background: #303639; overflow: hidden; }.meter span { display: block; height: 100%; background: var(--signal); transition: width .5s ease; }
@@ -286,7 +297,7 @@ fieldset { padding: 0; border: 0; margin: 0; }
   .hero { min-height: auto; grid-template-columns: 1fr; gap: 35px; padding-block: 58px 45px; }
   .hero-filmstrip { height: 160px; justify-content: center; }.hero-filmstrip .film-frame { height: 145px; width: 98px; }.film-arrow { display: none; }
   .workspace { grid-template-columns: 1fr; padding-block: 48px 80px; }.production-dock { position: relative; top: 0; order: -1; display: grid; grid-template-columns: 110px 1fr; gap: 14px 20px; }.dock-top { grid-column: 1/-1; }.spec-monitor { width: 100px; height: 178px; grid-row: 2/5; margin: 0; }.dock-title, .spec-list, .cost-box { margin-top: 0; }.rights-check, .form-message, .start-button, .dock-footnote { grid-column: 1/-1; }
-  .monitor-grid { grid-template-columns: 1fr; }.stage-rail { min-height: auto; display: grid; grid-template-columns: repeat(8, minmax(104px,1fr)); overflow-x: auto; gap: 8px; }.stage-rail .section-kicker { grid-column: 1/-1; }.stage-item { min-height: 76px; display: block; }.stage-item::after { display: none; }.stage-item strong { white-space: normal; }.portrait-monitor { max-height: 62dvh; width: auto; max-width: 100%; }
+  .monitor-grid { grid-template-columns: 1fr; }.stage-rail { min-height: auto; display: grid; grid-template-columns: repeat(9, minmax(104px,1fr)); overflow-x: auto; gap: 8px; }.stage-rail .section-kicker { grid-column: 1/-1; }.stage-item { min-height: 76px; display: block; }.stage-item::after { display: none; }.stage-item strong { white-space: normal; }.portrait-monitor { max-height: 62dvh; width: auto; max-width: 100%; }
   .run-inspector { display: block; }
   .delivery-grid { grid-template-columns: 1fr; }.delivery-monitor { max-height: 68dvh; width: auto; }.delivery-panel { max-width: 520px; width: 100%; margin-inline: auto; }
 }

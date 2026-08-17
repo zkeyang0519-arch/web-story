@@ -2,6 +2,7 @@
 
 import { useEffect, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
+import Image from "next/image";
 import { calculateCostQuote, type CostQuote } from "@/lib/cost";
 
 type ReferenceItem = {
@@ -41,6 +42,9 @@ type Project = {
   progress: number;
   runMode: "demo" | "production";
   pipelinePhase?: string | null;
+  keyframeUrl?: string | null;
+  keyframeModel?: string | null;
+  keyframeSize?: string | null;
   activity?: ActivityEvent[];
   error?: { code?: string; message?: string } | null;
   createdAt: string;
@@ -79,10 +83,11 @@ const processSteps = [
   { key: "receive", label: "接收并校验参考素材", detail: "确认文件、链接与素材权限", end: 6 },
   { key: "preprocess", label: "方舟文件预处理", detail: "上传并准备画面与声音轨道", end: 18 },
   { key: "understand", label: "逐条视频内容解析", detail: "提取高光、节奏与创意机制", end: 30 },
-  { key: "creative", label: "创意比较与融合", detail: "只收敛一个原创创意方向", end: 46 },
-  { key: "storyboard", label: "镜头计划与生成提示词", detail: "整理15秒时间轴和一致性约束", end: 55 },
-  { key: "submit", label: "提交 Seedance 2.0", detail: "创建任务并等待生成资源", end: 63 },
-  { key: "render", label: "渲染画面、动作与声音", detail: "实时查询 Seedance 任务状态", end: 90 },
+  { key: "creative", label: "创意融合与剧本生成", detail: "收敛唯一创意和15秒剧本", end: 42 },
+  { key: "keyframe", label: "Seedream 首帧生成", detail: "生成并归档9:16关键视觉", end: 57 },
+  { key: "prompt", label: "图生视频提示词装配", detail: "绑定首帧和动作时间轴", end: 64 },
+  { key: "submit", label: "提交 Seedance 2.0", detail: "以关键帧为首帧创建视频任务", end: 69 },
+  { key: "render", label: "渲染画面、动作与声音", detail: "实时查询 Seedance 任务状态", end: 92 },
   { key: "deliver", label: "质量校验、归档与交付", detail: "下载成片并校验文件完整性", end: 101 },
 ] as const;
 
@@ -132,7 +137,7 @@ function statusCopy(status: string) {
   const copy: Record<string, { eyebrow: string; title: string; detail: string }> = {
     ingesting: { eyebrow: "正在建立素材语境", title: "先看懂参考，再开始创作", detail: "提取节奏、画面语言与创意钩子，过滤水印、片尾和无效片段。" },
     analyzing: { eyebrow: "创意中枢工作中", title: "比较创意，并收敛成一个方向", detail: "Seed 视觉解析与高质量复核模型会提取、比较并融合创意，只把最终结论交给生成环节。" },
-    generating_assets: { eyebrow: "视觉预制中", title: "正在统一人物、场景与光线", detail: "先准备关键画面与镜头连续性，降低直接生成视频的随机性。" },
+    generating_assets: { eyebrow: "Seedream 关键帧生成中", title: "正在把剧本变成首帧画面", detail: "生成9:16关键视觉并归档，完成后作为 Seedance 图生视频的首帧。" },
     generating_video: { eyebrow: "Seedance 2.0 生成中", title: "镜头正在逐条进入监看台", detail: "高风险镜头会生成备选版本，系统自动保留质量更高的一条。" },
     quality_checking: { eyebrow: "质量门检查中", title: "发现问题会只重做局部镜头", detail: "检查主体一致性、运动合理性、文字、节奏与画面瑕疵。" },
     post_processing: { eyebrow: "最后装配", title: "正在完成声音、字幕与节奏", detail: "配音、环境声、版权安全音乐和字幕统一完成后进入终检。" },
@@ -477,12 +482,12 @@ export function Studio({ view = "references", projectId }: { view?: StudioView; 
   async function confirmCostAndStart() {
     setMessage("");
     if (!costAccepted) return setMessage("请先确认预计平台成本。 ");
-    if (!project?.input.quote) return setMessage("成本预估尚未准备好，请刷新重试。 ");
+    if (!project) return setMessage("成本预估尚未准备好，请刷新重试。 ");
     setSubmitting(true);
     try {
       setSubmitLabel("确认并创建任务");
       const requestKey = uid("req");
-      await patchDraft("quote", { accepted: true, quoteVersion: project.input.quote.version }, true);
+      await patchDraft("quote", { accepted: true, quoteVersion: calculateCostQuote(references.length, duration).version }, true);
       if (!activeProjectId) throw new Error("草稿尚未准备好，请稍后重试。");
       const response = await fetch(`/api/projects/${activeProjectId}/generate`, {
         method: "POST",
@@ -552,7 +557,8 @@ export function Studio({ view = "references", projectId }: { view?: StudioView; 
   const shotsDone = project ? Math.min(shotTotal, Math.max(0, Math.round((project.progress - 42) / 58 * shotTotal))) : 0;
   const canBriefContinue = references.length > 0 && Boolean(audience.trim()) && (topicMode === "ai" || Boolean(topic.trim()));
   const canStart = canBriefContinue && rightsConfirmed;
-  const quote = project?.input.quote ?? calculateCostQuote(references.length, duration);
+  const currentQuote = calculateCostQuote(references.length, duration);
+  const quote = project?.input.quote?.version === currentQuote.version ? project.input.quote : currentQuote;
   const title = topicMode === "manual" && topic.trim() ? topic.trim() : "AI 将根据参考视频自动定题";
   const modelLabel = system.model || "Seedance 2.0 Standard";
   const createStep = view === "references" ? 1 : view === "brief" ? 2 : view === "spec" ? 3 : 4;
@@ -606,11 +612,14 @@ export function Studio({ view = "references", projectId }: { view?: StudioView; 
             })}
           </aside>
 
-          <div className="portrait-monitor is-processing">
+          <div className={`portrait-monitor is-processing ${project.keyframeUrl ? "has-keyframe" : ""}`}>
             <div className="monitor-topline"><span>MONITOR A</span><span>9:16 · 24 FPS</span></div>
+            {project.keyframeUrl && <Image className="keyframe-preview" src={project.keyframeUrl} alt="Seedream 生成的首帧关键视觉" fill sizes="(max-width: 820px) 62vh, 390px" unoptimized />}
             <div className="focus-corners" aria-hidden="true"><i /><i /><i /><i /></div>
-            <div className="processing-orbit" aria-hidden="true"><span /><span /><span /></div>
-            <div className="monitor-copy">
+            {!project.keyframeUrl && <div className="processing-orbit" aria-hidden="true"><span /><span /><span /></div>}
+            {project.pipelinePhase === "generating_keyframe" && !project.keyframeUrl && <div className="keyframe-live"><i /><span>SEEDREAM</span><strong>正在生成首帧关键视觉</strong><small>主体 · 场景 · 构图 · 光线</small></div>}
+            {project.keyframeUrl && <div className="keyframe-ready"><span>KEYFRAME READY</span><small>{project.keyframeModel ?? "Seedream 5.0 Lite"} · {project.keyframeSize ?? "2K"}</small></div>}
+            <div className={`monitor-copy ${project.keyframeUrl ? "over-keyframe" : ""}`}>
               <span>{currentCopy.eyebrow}</span>
               <strong>{currentCopy.title}</strong>
               <p>{currentCopy.detail}</p>
@@ -653,7 +662,7 @@ export function Studio({ view = "references", projectId }: { view?: StudioView; 
           <div className="shot-strip">
             {Array.from({ length: shotTotal }).map((_, index) => {
               const ready = index < shotsDone;
-              const active = index === shotsDone && currentProcessIndex >= 5 && currentProcessIndex < processSteps.length;
+              const active = index === shotsDone && currentProcessIndex >= 6 && currentProcessIndex < processSteps.length;
               return <div className={`shot-card shot-${index % 4} ${ready ? "ready" : ""} ${active ? "active" : ""}`} key={index}>
                 <span>SHOT {String(index + 1).padStart(2, "0")}</span>
                 <i>{ready ? "✓ 已通过" : active ? "生成中" : "等待"}</i>
@@ -796,8 +805,9 @@ export function Studio({ view = "references", projectId }: { view?: StudioView; 
             <div className="quote-total"><span>本次预计平台成本</span><strong>￥{quote.totalMin.toFixed(2)} <i>—</i> ￥{quote.totalMax.toFixed(2)}</strong><p>实际金额以火山方舟任务完成后返回的用量为准。</p></div>
             <div className="quote-breakdown">
               <div><span><b>01</b>参考视频 AI 解析</span><strong>￥{quote.analysis.min.toFixed(2)} — ￥{quote.analysis.max.toFixed(2)}</strong><small>{quote.referenceCount} 个参考视频 · 解析高光、节奏与创意机制</small></div>
-              <div><span><b>02</b>Seedance 视频生成</span><strong>￥{quote.generation.min.toFixed(2)} — ￥{quote.generation.max.toFixed(2)}</strong><small>{quote.model} · {quote.duration} 秒 · 9:16 · 1080p</small></div>
-              <div><span><b>03</b>成片归档与存储</span><strong>￥{quote.storage.min.toFixed(2)} — ￥{quote.storage.max.toFixed(2)}</strong><small>下载、完整性校验并保存到对象存储</small></div>
+              <div><span><b>02</b>Seedream 首帧关键视觉</span><strong>￥{quote.keyframe.min.toFixed(2)}</strong><small>1 张 · 9:16 · 2K · 用作 Seedance 图生视频首帧</small></div>
+              <div><span><b>03</b>Seedance 视频生成</span><strong>￥{quote.generation.min.toFixed(2)} — ￥{quote.generation.max.toFixed(2)}</strong><small>{quote.model} · {quote.duration} 秒 · 9:16 · 1080p</small></div>
+              <div><span><b>04</b>成片归档与存储</span><strong>￥{quote.storage.min.toFixed(2)} — ￥{quote.storage.max.toFixed(2)}</strong><small>下载、完整性校验并保存到对象存储</small></div>
             </div>
             <div className="quote-gate"><span>尚未启动任何 AI 视频解析或生成</span><p>点击确认后才会依次启动参考解析、创意融合和 Seedance 生成。任一步失败都会立即停止。</p></div>
           </section>}

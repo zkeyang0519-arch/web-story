@@ -1,6 +1,6 @@
 # 镜流 · AI 短视频工坊
 
-内部团队使用的一键成片 MVP。用户添加 1～10 个参考视频，填写主题、目标观众与成片规格，确认预计平台成本后，系统才通过统一管线完成参考解析、创意收敛、视觉预制、Seedance 2.0 镜头生成、质量检查与后期交付。
+内部团队使用的一键成片 MVP。用户添加 1～10 个参考视频，填写主题、目标观众与成片规格，确认预计平台成本后，系统才通过统一管线完成参考解析、创意收敛、Seedream 首帧生成、Seedance 2.0 图生视频、质量检查与后期交付。
 
 ## 当前版本
 
@@ -37,6 +37,7 @@ npm test
 - `ARK_API_KEY`（必填，仅服务端 Secret）
 - `ARK_ANALYSIS_MODEL`（可选，默认 `doubao-seed-2-0-lite-260428`）
 - `ARK_REVIEW_MODEL`（可选，默认 `doubao-seed-2-1-pro-260628`）
+- `ARK_IMAGE_MODEL`（可选，默认 `doubao-seedream-5-0-lite-260128`）
 - `ARK_VIDEO_MODEL`（可选，默认 `doubao-seedance-2-0-260128`）
 
 真实模式会把上传的视频流式送入方舟 Files API，由视觉模型逐条解析，使用复核模型收敛一个原创创意，再异步提交 Seedance 2.0 Standard。成片成功后立即归档到 R2，并按方舟返回的 token 用量回填平台成本。

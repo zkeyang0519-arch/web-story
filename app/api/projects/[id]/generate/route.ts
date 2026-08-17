@@ -11,7 +11,7 @@ function ownerId(request: Request) {
 }
 
 function present(row: typeof projects.$inferSelect) {
-  const pipeline = row.pipelineJson ? JSON.parse(row.pipelineJson) as { phase?: string; events?: unknown[] } : null;
+  const pipeline = row.pipelineJson ? JSON.parse(row.pipelineJson) as { phase?: string; events?: unknown[]; keyframe?: { objectKey?: string; model?: string; size?: string } } : null;
   return {
     id: row.id,
     title: row.title,
@@ -21,6 +21,9 @@ function present(row: typeof projects.$inferSelect) {
     progress: row.progress,
     runMode: row.runMode,
     pipelinePhase: pipeline?.phase ?? null,
+    keyframeUrl: pipeline?.keyframe?.objectKey ? `/api/media/${encodeURIComponent(pipeline.keyframe.objectKey)}` : null,
+    keyframeModel: pipeline?.keyframe?.model ?? null,
+    keyframeSize: pipeline?.keyframe?.size ?? null,
     activity: pipeline?.events ?? [],
     error: row.errorJson ? JSON.parse(row.errorJson) : null,
     createdAt: row.runStartedAt ?? row.createdAt,
