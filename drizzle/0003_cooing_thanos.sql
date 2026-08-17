@@ -1,0 +1,1 @@
+ALTER TABLE `projects` ADD `pipeline_json` text;

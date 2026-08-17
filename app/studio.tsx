@@ -126,7 +126,7 @@ function formatElapsed(createdAt: string) {
 function statusCopy(status: string) {
   const copy: Record<string, { eyebrow: string; title: string; detail: string }> = {
     ingesting: { eyebrow: "正在建立素材语境", title: "先看懂参考，再开始创作", detail: "提取节奏、画面语言与创意钩子，过滤水印、片尾和无效片段。" },
-    analyzing: { eyebrow: "创意中枢工作中", title: "比较创意，并收敛成一个方向", detail: "MiMo / Qwen 的双路解析会在真实管线中相互校验，只把最终结论交给后续环节。" },
+    analyzing: { eyebrow: "创意中枢工作中", title: "比较创意，并收敛成一个方向", detail: "Seed 视觉解析与高质量复核模型会提取、比较并融合创意，只把最终结论交给生成环节。" },
     generating_assets: { eyebrow: "视觉预制中", title: "正在统一人物、场景与光线", detail: "先准备关键画面与镜头连续性，降低直接生成视频的随机性。" },
     generating_video: { eyebrow: "Seedance 2.0 生成中", title: "镜头正在逐条进入监看台", detail: "高风险镜头会生成备选版本，系统自动保留质量更高的一条。" },
     quality_checking: { eyebrow: "质量门检查中", title: "发现问题会只重做局部镜头", detail: "检查主体一致性、运动合理性、文字、节奏与画面瑕疵。" },
@@ -165,6 +165,7 @@ export function Studio({ view = "references", projectId }: { view?: StudioView; 
   const videoRef = useRef<HTMLVideoElement>(null);
   const draftCreateStarted = useRef(false);
   const draftVersionRef = useRef(1);
+  const pollInFlight = useRef(false);
   const activeProjectId = project?.id ?? projectId;
 
   useEffect(() => {
@@ -232,6 +233,8 @@ export function Studio({ view = "references", projectId }: { view?: StudioView; 
   useEffect(() => {
     if (view !== "progress" || !activeProjectId) return;
     const timer = window.setInterval(async () => {
+      if (pollInFlight.current) return;
+      pollInFlight.current = true;
       setElapsedTick((value) => value + 1);
       try {
         const response = await fetch(`/api/projects/${activeProjectId}`, { cache: "no-store" });
@@ -242,6 +245,8 @@ export function Studio({ view = "references", projectId }: { view?: StudioView; 
         if (data.project.status === "completed") router.replace(`/projects/${data.project.id}/delivery`);
       } catch {
         // The persisted project stays visible while a transient poll fails.
+      } finally {
+        pollInFlight.current = false;
       }
     }, 1500);
     return () => window.clearInterval(timer);
@@ -700,7 +705,7 @@ export function Studio({ view = "references", projectId }: { view?: StudioView; 
 
           {view === "spec" && <section className="form-section step-form-section spec-form-section">
             <div className="section-heading"><span className="section-number">03</span><div><h2>成片设置</h2><p>这些设置会冻结到本次生成任务中。</p></div></div>
-            <div className="two-fields"><div className="field"><span>发布平台</span><div className="segmented">{["抖音", "小红书"].map((item) => <button className={platform === item ? "active" : ""} key={item} onClick={() => setPlatform(item)}>{item}</button>)}</div></div><div className="field"><span>成片时长</span><div className="segmented">{[15, 30, 60].map((item) => <button className={duration === item ? "active" : ""} key={item} onClick={() => setDuration(item)}>{item}s</button>)}</div></div></div>
+            <div className="two-fields"><div className="field"><span>发布平台</span><div className="segmented">{["抖音", "小红书"].map((item) => <button className={platform === item ? "active" : ""} key={item} onClick={() => setPlatform(item)}>{item}</button>)}</div></div><div className="field"><span>成片时长</span><div className="segmented"><button className="active" onClick={() => setDuration(15)}>15s</button></div></div></div>
             <div className="field"><span>画面风格</span><div className="choice-grid styles">{styles.map((item) => <button className={style === item ? "active" : ""} key={item} onClick={() => setStyle(item)}>{item}</button>)}</div></div>
             <div className="locked-specs"><div><span>画幅</span><strong>9:16 竖屏</strong></div><div><span>清晰度</span><strong>1080 × 1920</strong></div><div><span>帧率</span><strong>24 fps</strong></div><div><span>模型</span><strong>{modelLabel}</strong></div></div>
           </section>}

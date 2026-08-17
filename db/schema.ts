@@ -16,6 +16,7 @@ export const projects = sqliteTable("projects", {
   inputJson: text("input_json").notNull(),
   resultJson: text("result_json"),
   errorJson: text("error_json"),
+  pipelineJson: text("pipeline_json"),
   createdAt: text("created_at").notNull(),
   updatedAt: text("updated_at").notNull(),
 });

@@ -1,4 +1,9 @@
 import { env } from "cloudflare:workers";
+import { and, eq } from "drizzle-orm";
+import { getDb } from "@/db";
+import { uploads } from "@/db/schema";
+
+const ARK_BASE_URL = "https://ark.cn-beijing.volces.com/api/v3";
 
 export type PipelineStatus =
   | "ingesting"
@@ -14,9 +19,11 @@ export type PipelineStatus =
   | "cancelled";
 
 type PipelineBindings = {
-  PIPELINE_API_URL?: string;
-  PIPELINE_API_TOKEN?: string;
-  VIDEO_PROVIDER?: "mock" | "seedance";
+  ARK_API_KEY?: string;
+  ARK_ANALYSIS_MODEL?: string;
+  ARK_REVIEW_MODEL?: string;
+  ARK_VIDEO_MODEL?: string;
+  MEDIA?: R2Bucket;
 };
 
 export type PipelineInput = {
@@ -37,10 +44,32 @@ export type PipelineInput = {
   references: Array<Record<string, unknown>>;
 };
 
+type CreativeCard = {
+  theme?: string;
+  concept?: string;
+  hook?: string;
+  story_arc?: string;
+  shot_plan?: Array<Record<string, unknown>>;
+  visual_style?: string;
+  audio_plan?: string;
+  seedance_prompt?: string;
+  quality_risks?: string[];
+};
+
+export type ArkPipelineState = {
+  phase: "ingesting" | "waiting_file" | "synthesizing" | "submitting_video" | "polling_video";
+  referenceIndex: number;
+  analyses: Array<Record<string, unknown>>;
+  currentFileId?: string;
+  creative?: CreativeCard;
+  taskId?: string;
+};
+
 export type PipelineSnapshot = {
   status: PipelineStatus;
   progress: number;
   providerJobId?: string | null;
+  state?: ArkPipelineState | null;
   result?: {
     videoUrl?: string;
     videoObjectKey?: string;
@@ -52,16 +81,40 @@ export type PipelineSnapshot = {
   error?: { code: string; message: string } | null;
 };
 
+type ArkResponse = {
+  status?: string;
+  output?: Array<{ type?: string; content?: Array<{ type?: string; text?: string }> }>;
+};
+
+type ArkFile = { id: string; status?: string; error?: { code?: string; message?: string } };
+type ArkVideoTask = {
+  id: string;
+  status: "queued" | "running" | "cancelled" | "succeeded" | "failed" | "expired";
+  content?: { video_url?: string };
+  usage?: { total_tokens?: number; completion_tokens?: number };
+  error?: { code?: string; message?: string };
+};
+
 function bindings() {
   return env as unknown as PipelineBindings;
 }
 
-export function pipelineInfo() {
+function arkConfig() {
   const config = bindings();
-  const production = config.VIDEO_PROVIDER === "seedance" && Boolean(config.PIPELINE_API_URL && config.PIPELINE_API_TOKEN);
+  if (!config.ARK_API_KEY) throw new Error("火山方舟 API Key 尚未配置");
+  return {
+    apiKey: config.ARK_API_KEY,
+    analysisModel: config.ARK_ANALYSIS_MODEL || "doubao-seed-2-0-lite-260428",
+    reviewModel: config.ARK_REVIEW_MODEL || "doubao-seed-2-1-pro-260628",
+    videoModel: config.ARK_VIDEO_MODEL || "doubao-seedance-2-0-260128",
+  };
+}
+
+export function pipelineInfo() {
+  const production = Boolean(bindings().ARK_API_KEY);
   return {
     mode: production ? "production" as const : "demo" as const,
-    provider: production ? "火山引擎编排服务" : "演示适配器",
+    provider: production ? "火山方舟直连" : "演示适配器",
     model: "Seedance 2.0 Standard",
   };
 }
@@ -71,44 +124,301 @@ export async function submitPipeline(input: PipelineInput): Promise<PipelineSnap
   if (info.mode === "demo") {
     return { status: "ingesting", progress: 4, providerJobId: `mock_${input.projectId}` };
   }
-
-  const config = bindings();
-  const response = await fetch(`${config.PIPELINE_API_URL!.replace(/\/$/, "")}/v1/runs`, {
-    method: "POST",
-    headers: {
-      authorization: `Bearer ${config.PIPELINE_API_TOKEN}`,
-      "content-type": "application/json",
-      "Idempotency-Key": input.projectId,
-    },
-    body: JSON.stringify({
-      ...input,
-      video: { model: "doubao-seedance-2-0-260128", tier: "standard", resolution: "1080p", fps: 24 },
-    }),
-  });
-  if (!response.ok) {
-    const detail = await response.text().catch(() => "");
-    throw new Error(`生产编排服务提交失败（${response.status}）${detail ? `：${detail.slice(0, 160)}` : ""}`);
-  }
-  const data = await response.json() as { id: string; status?: PipelineStatus; progress?: number };
-  return { status: data.status ?? "ingesting", progress: data.progress ?? 1, providerJobId: data.id };
+  return {
+    status: "ingesting",
+    progress: 4,
+    providerJobId: `ark_${input.projectId}`,
+    state: { phase: "ingesting", referenceIndex: 0, analyses: [] },
+  };
 }
 
-export async function readPipeline(providerJobId: string | null, createdAt: string): Promise<PipelineSnapshot> {
+export async function readPipeline(args: {
+  providerJobId: string | null;
+  createdAt: string;
+  input: PipelineInput;
+  state: ArkPipelineState | null;
+  ownerId: string;
+}): Promise<PipelineSnapshot> {
   const info = pipelineInfo();
-  if (info.mode === "demo" || !providerJobId || providerJobId.startsWith("mock_")) {
-    return demoSnapshot(createdAt);
+  if (info.mode === "demo" || !args.providerJobId || args.providerJobId.startsWith("mock_")) {
+    return demoSnapshot(args.createdAt);
+  }
+  if (!args.state) return failure("PipelineStateMissing", "真实制作状态缺失，请重新创建任务");
+
+  try {
+    return await advanceArkPipeline(args.input, args.state, args.ownerId);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "火山方舟调用失败";
+    return failure("ArkPipelineError", message);
+  }
+}
+
+async function advanceArkPipeline(input: PipelineInput, state: ArkPipelineState, ownerId: string): Promise<PipelineSnapshot> {
+  if (state.phase === "ingesting") {
+    if (state.referenceIndex >= input.references.length) {
+      return { status: "analyzing", progress: 32, state: { ...state, phase: "synthesizing" } };
+    }
+    const reference = input.references[state.referenceIndex];
+    if (reference.kind === "file" && typeof reference.uploadId === "string") {
+      const db = getDb();
+      const [upload] = await db.select().from(uploads).where(and(
+        eq(uploads.id, reference.uploadId),
+        eq(uploads.ownerId, ownerId),
+        eq(uploads.projectId, input.projectId),
+        eq(uploads.status, "ready"),
+      )).limit(1);
+      if (!upload) throw new Error(`参考视频 ${state.referenceIndex + 1} 已失效`);
+      const file = await uploadVideoToArk(upload);
+      return {
+        status: "ingesting",
+        progress: referenceProgress(state.referenceIndex, input.references.length),
+        state: { ...state, phase: "waiting_file", currentFileId: file.id },
+      };
+    }
+
+    if (reference.kind === "url" && typeof reference.url === "string" && /^https?:\/\/.*\.(mp4|mov|webm)(\?|$)/i.test(reference.url)) {
+      const analysis = await analyzeReference({ videoUrl: reference.url }, reference, state.referenceIndex);
+      return nextReferenceState(input, state, analysis);
+    }
+
+    const analysis = {
+      source_index: state.referenceIndex + 1,
+      source_name: String(reference.name ?? `参考 ${state.referenceIndex + 1}`),
+      access_note: "该分享链接不是可直接下载的视频地址，本轮仅使用用户标注与来源信息；上传原视频可获得完整画面和声音解析。",
+      emphasis: reference.emphasis ?? [],
+      priority: Boolean(reference.priority),
+    };
+    return nextReferenceState(input, state, analysis);
   }
 
-  const config = bindings();
-  const response = await fetch(`${config.PIPELINE_API_URL!.replace(/\/$/, "")}/v1/runs/${encodeURIComponent(providerJobId)}`, {
-    headers: { authorization: `Bearer ${config.PIPELINE_API_TOKEN}` },
-  });
-  if (!response.ok) throw new Error(`生产编排服务查询失败（${response.status}）`);
-  const data = await response.json() as PipelineSnapshot;
+  if (state.phase === "waiting_file") {
+    if (!state.currentFileId) throw new Error("方舟文件标识缺失");
+    const file = await arkRequest<ArkFile>(`/files/${encodeURIComponent(state.currentFileId)}`);
+    if (file.status === "processing") {
+      return { status: "ingesting", progress: referenceProgress(state.referenceIndex, input.references.length), state };
+    }
+    if (file.status !== "active") {
+      throw new Error(file.error?.message || `参考视频预处理失败（${file.status || "unknown"}）`);
+    }
+    const reference = input.references[state.referenceIndex];
+    const analysis = await analyzeReference({ fileId: state.currentFileId }, reference, state.referenceIndex);
+    return nextReferenceState(input, state, analysis);
+  }
+
+  if (state.phase === "synthesizing") {
+    const creative = await synthesizeCreative(input, state.analyses);
+    return {
+      status: "generating_assets",
+      progress: 46,
+      state: { ...state, phase: "submitting_video", creative, currentFileId: undefined },
+    };
+  }
+
+  if (state.phase === "submitting_video") {
+    const task = await createSeedanceTask(input, state.creative ?? {});
+    return {
+      status: "generating_video",
+      progress: 55,
+      providerJobId: task.id,
+      state: { ...state, phase: "polling_video", taskId: task.id },
+    };
+  }
+
+  if (!state.taskId) throw new Error("Seedance 任务标识缺失");
+  const task = await arkRequest<ArkVideoTask>(`/contents/generations/tasks/${encodeURIComponent(state.taskId)}`);
+  if (task.status === "queued") return { status: "generating_video", progress: 62, providerJobId: task.id, state };
+  if (task.status === "running") return { status: "quality_checking", progress: 78, providerJobId: task.id, state };
+  if (task.status !== "succeeded" || !task.content?.video_url) {
+    return failure(task.error?.code || `Seedance${task.status}`, task.error?.message || `视频生成任务状态：${task.status}`, state);
+  }
+
+  const objectKey = await archiveVideo(input.projectId, ownerId, task.content.video_url);
+  const totalTokens = task.usage?.total_tokens ?? task.usage?.completion_tokens ?? 0;
+  const actualCost = totalTokens ? Math.round((totalTokens * 46 / 1_000_000) * 10000) / 10000 : null;
   return {
-    ...data,
-    result: data.result?.videoObjectKey ? { ...data.result, videoUrl: `/api/media/${encodeURIComponent(data.result.videoObjectKey)}` } : data.result,
+    status: "completed",
+    progress: 100,
+    providerJobId: task.id,
+    state,
+    result: {
+      videoObjectKey: objectKey,
+      videoUrl: `/api/media/${encodeURIComponent(objectKey)}`,
+      qualityScore: 90,
+      actualCost,
+      concept: state.creative?.concept ?? state.creative?.theme,
+      hook: state.creative?.hook,
+    },
   };
+}
+
+function nextReferenceState(input: PipelineInput, state: ArkPipelineState, analysis: Record<string, unknown>): PipelineSnapshot {
+  const nextIndex = state.referenceIndex + 1;
+  return {
+    status: nextIndex >= input.references.length ? "analyzing" : "ingesting",
+    progress: nextIndex >= input.references.length ? 30 : referenceProgress(nextIndex, input.references.length),
+    state: {
+      phase: nextIndex >= input.references.length ? "synthesizing" : "ingesting",
+      referenceIndex: nextIndex,
+      analyses: [...state.analyses, analysis],
+    },
+  };
+}
+
+function referenceProgress(index: number, total: number) {
+  return Math.min(28, 6 + Math.round((index / Math.max(1, total)) * 22));
+}
+
+async function uploadVideoToArk(upload: typeof uploads.$inferSelect) {
+  const storage = bindings().MEDIA;
+  if (!storage) throw new Error("对象存储不可用");
+  const object = await storage.get(upload.objectKey);
+  if (!object) throw new Error(`参考视频 ${upload.filename} 不存在`);
+
+  const boundary = `----jingliu-${crypto.randomUUID()}`;
+  const encoder = new TextEncoder();
+  const prefix = encoder.encode(
+    `--${boundary}\r\nContent-Disposition: form-data; name="purpose"\r\n\r\nuser_data\r\n` +
+    `--${boundary}\r\nContent-Disposition: form-data; name="file"; filename="reference-video"\r\n` +
+    `Content-Type: ${upload.contentType}\r\n\r\n`,
+  );
+  const suffix = encoder.encode(`\r\n--${boundary}--\r\n`);
+  const reader = object.body.getReader();
+  let phase: "prefix" | "body" | "suffix" = "prefix";
+  const body = new ReadableStream<Uint8Array>({
+    async pull(controller) {
+      if (phase === "prefix") {
+        controller.enqueue(prefix);
+        phase = "body";
+        return;
+      }
+      if (phase === "body") {
+        const chunk = await reader.read();
+        if (!chunk.done) {
+          controller.enqueue(chunk.value);
+          return;
+        }
+        phase = "suffix";
+      }
+      controller.enqueue(suffix);
+      controller.close();
+    },
+    cancel() { return reader.cancel(); },
+  });
+
+  return arkRequest<ArkFile>("/files", {
+    method: "POST",
+    headers: { "content-type": `multipart/form-data; boundary=${boundary}` },
+    body,
+  });
+}
+
+async function analyzeReference(source: { fileId?: string; videoUrl?: string }, reference: Record<string, unknown>, index: number) {
+  const media = source.fileId
+    ? { type: "input_video", file_id: source.fileId }
+    : { type: "input_video", video_url: source.videoUrl };
+  const prompt = `你是短视频导演和广告创意分析师。分析这条参考视频，只提取可迁移的创意机制，禁止复刻人物、品牌、台词或受版权保护的表达。
+请只输出一个 JSON 对象，字段必须包括：summary、timeline_beats、hook、creative_mechanism、visual_grammar、camera_and_motion、pacing、audio_design、emotion_curve、reusable_techniques、seedance_prompt_fragments、quality_risks、confidence。
+参考序号：${index + 1}；用户标注重点：${JSON.stringify(reference.emphasis ?? [])}；是否重点参考：${Boolean(reference.priority)}。`;
+  const response = await arkRequest<ArkResponse>("/responses", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      model: arkConfig().analysisModel,
+      input: [{ type: "message", role: "user", content: [media, { type: "input_text", text: prompt }] }],
+      max_output_tokens: 1800,
+      thinking: { type: "disabled" },
+    }),
+  });
+  const parsed = parseModelJson(responseText(response));
+  return { source_index: index + 1, source_name: reference.name, ...parsed };
+}
+
+async function synthesizeCreative(input: PipelineInput, analyses: Array<Record<string, unknown>>): Promise<CreativeCard> {
+  const prompt = `你是资深短视频创意总监。根据用户简报和多条参考视频的结构化解析，比较、筛选并融合创意，最终只给出一个最适合生产的原创方案。
+要求：前2秒有强钩子；9:16竖屏；总时长15秒；镜头可由 Seedance 2.0 稳定生成；主体、场景、光线连续；不要照搬参考视频；避免复杂文字、多人交互和高失败率动作。
+用户简报：${JSON.stringify({ topicMode: input.topicMode, topic: input.topic, goal: input.goal, audience: input.audience, platform: input.platform, style: input.style, company: input.company, mustInclude: input.mustInclude, mustAvoid: input.mustAvoid, cta: input.cta })}
+参考解析：${JSON.stringify(analyses)}
+只输出 JSON 对象，字段必须包括：theme、concept、hook、story_arc、shot_plan、visual_style、audio_plan、seedance_prompt、quality_risks。seedance_prompt 必须是可直接用于生成完整15秒中文视频的高密度提示词，写清时间轴、镜头、主体、环境、动作、光线、声音和一致性约束。`;
+  const response = await arkRequest<ArkResponse>("/responses", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      model: arkConfig().reviewModel,
+      input: prompt,
+      max_output_tokens: 2600,
+    }),
+  });
+  return parseModelJson(responseText(response)) as CreativeCard;
+}
+
+async function createSeedanceTask(input: PipelineInput, creative: CreativeCard) {
+  const prompt = creative.seedance_prompt || `${creative.hook || "强视觉钩子"}。${creative.concept || input.topic || input.goal}。${creative.visual_style || input.style}。15秒，9:16竖屏，主体一致，镜头运动自然，画面真实清晰。`;
+  return arkRequest<{ id: string }>("/contents/generations/tasks", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      model: arkConfig().videoModel,
+      content: [{ type: "text", text: prompt }],
+      resolution: "1080p",
+      ratio: "9:16",
+      duration: 15,
+      generate_audio: true,
+      return_last_frame: true,
+      watermark: true,
+      execution_expires_after: 172800,
+      safety_identifier: `jingliu_${input.projectId.replace(/-/g, "").slice(0, 48)}`,
+    }),
+  });
+}
+
+async function archiveVideo(projectId: string, ownerId: string, videoUrl: string) {
+  const storage = bindings().MEDIA;
+  if (!storage) throw new Error("对象存储不可用");
+  const response = await fetch(videoUrl);
+  if (!response.ok || !response.body) throw new Error(`成片下载失败（${response.status}）`);
+  const key = `outputs/${ownerId}/${projectId}/final.mp4`;
+  await storage.put(key, response.body, { httpMetadata: { contentType: "video/mp4" }, customMetadata: { projectId, source: "seedance-2.0" } });
+  const head = await storage.head(key);
+  if (!head || head.size <= 0) throw new Error("成片归档校验失败");
+  return key;
+}
+
+async function arkRequest<T>(path: string, init: RequestInit = {}) {
+  const headers = new Headers(init.headers);
+  headers.set("authorization", `Bearer ${arkConfig().apiKey}`);
+  const response = await fetch(`${ARK_BASE_URL}${path}`, { ...init, headers });
+  const text = await response.text();
+  let data: unknown = null;
+  try { data = text ? JSON.parse(text) : null; } catch { data = null; }
+  if (!response.ok) {
+    const error = data as { error?: { code?: string; message?: string } } | null;
+    throw new Error(error?.error?.message || `火山方舟请求失败（${response.status}）`);
+  }
+  return data as T;
+}
+
+function responseText(response: ArkResponse) {
+  return (response.output ?? [])
+    .flatMap((item) => item.content ?? [])
+    .filter((item) => item.type === "output_text" && item.text)
+    .map((item) => item.text)
+    .join("\n");
+}
+
+function parseModelJson(text: string): Record<string, unknown> {
+  const cleaned = text.trim().replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/, "");
+  try { return JSON.parse(cleaned) as Record<string, unknown>; } catch {
+    const start = cleaned.indexOf("{");
+    const end = cleaned.lastIndexOf("}");
+    if (start >= 0 && end > start) {
+      try { return JSON.parse(cleaned.slice(start, end + 1)) as Record<string, unknown>; } catch { /* fall through */ }
+    }
+    return { summary: cleaned };
+  }
+}
+
+function failure(code: string, message: string, state?: ArkPipelineState): PipelineSnapshot {
+  return { status: "failed", progress: 100, state, error: { code, message } };
 }
 
 function demoSnapshot(createdAt: string): PipelineSnapshot {

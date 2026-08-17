@@ -1,7 +1,7 @@
 import { and, eq } from "drizzle-orm";
 import { ensureDatabase, getDb } from "@/db";
 import { projects, uploads } from "@/db/schema";
-import { readPipeline } from "@/lib/pipeline";
+import { readPipeline, type ArkPipelineState, type PipelineInput } from "@/lib/pipeline";
 
 export const dynamic = "force-dynamic";
 
@@ -41,11 +41,47 @@ export async function GET(request: Request, context: { params: Promise<{ id: str
     if (!row) return Response.json({ error: "任务不存在" }, { status: 404 });
 
     if (!["draft", "completed", "failed", "cancelled"].includes(row.status)) {
-      const snapshot = await readPipeline(row.providerJobId, row.runStartedAt ?? row.createdAt);
+      const pipelineState = row.pipelineJson ? JSON.parse(row.pipelineJson) as ArkPipelineState & { _lock?: { token: string; until: number } } : null;
+      if (pipelineState?._lock && pipelineState._lock.until > Date.now()) return Response.json({ project: present(row) });
+      const unlockedState = pipelineState ? { ...pipelineState } : null;
+      if (unlockedState) delete unlockedState._lock;
+      const lockToken = crypto.randomUUID();
+      const lockedJson = unlockedState ? JSON.stringify({ ...unlockedState, _lock: { token: lockToken, until: Date.now() + 120_000 } }) : null;
+      let lockedRow = row;
+      if (row.runMode === "production" && row.pipelineJson && lockedJson) {
+        const [acquired] = await db.update(projects).set({ pipelineJson: lockedJson }).where(and(
+          eq(projects.id, id),
+          eq(projects.ownerId, ownerId(request)),
+          eq(projects.pipelineJson, row.pipelineJson),
+        )).returning();
+        if (!acquired) return Response.json({ project: present(row) });
+        lockedRow = acquired;
+      }
+      const input = { ...JSON.parse(row.inputJson), projectId: row.id, title: row.title } as PipelineInput;
+      const snapshot = await readPipeline({
+        providerJobId: row.providerJobId,
+        createdAt: row.runStartedAt ?? row.createdAt,
+        input,
+        state: unlockedState,
+        ownerId: ownerId(request),
+      });
       const changed = snapshot.status !== row.status || snapshot.progress !== row.progress || Boolean(snapshot.result) !== Boolean(row.resultJson);
-      if (changed) {
+      if (changed || snapshot.state) {
         const now = new Date().toISOString();
-        const [updated] = await db.update(projects).set({ status: snapshot.status, progress: snapshot.progress, resultJson: snapshot.result ? JSON.stringify(snapshot.result) : row.resultJson, errorJson: snapshot.error ? JSON.stringify(snapshot.error) : row.errorJson, updatedAt: now }).where(and(eq(projects.id, id), eq(projects.ownerId, ownerId(request)))).returning();
+        const [updated] = await db.update(projects).set({
+          status: snapshot.status,
+          progress: snapshot.progress,
+          providerJobId: snapshot.providerJobId ?? row.providerJobId,
+          pipelineJson: snapshot.state ? JSON.stringify(snapshot.state) : row.pipelineJson,
+          resultJson: snapshot.result ? JSON.stringify(snapshot.result) : row.resultJson,
+          errorJson: snapshot.error ? JSON.stringify(snapshot.error) : row.errorJson,
+          updatedAt: now,
+        }).where(and(
+          eq(projects.id, id),
+          eq(projects.ownerId, ownerId(request)),
+          row.runMode === "production" && lockedJson ? eq(projects.pipelineJson, lockedRow.pipelineJson) : eq(projects.status, row.status),
+        )).returning();
+        if (!updated) return Response.json({ project: present(row) });
         return Response.json({ project: present(updated) });
       }
     }
@@ -102,7 +138,7 @@ export async function PATCH(request: Request, context: { params: Promise<{ id: s
     }
 
     if (body.step === "settings") {
-      if (!["抖音", "小红书"].includes(String(body.data.platform)) || ![15, 30, 60].includes(Number(body.data.duration)) || !String(body.data.style ?? "").trim()) return Response.json({ error: "成片平台、时长或风格无效" }, { status: 400 });
+      if (!["抖音", "小红书"].includes(String(body.data.platform)) || Number(body.data.duration) !== 15 || !String(body.data.style ?? "").trim()) return Response.json({ error: "MVP 当前固定生成 15 秒成片，请检查平台、时长或风格" }, { status: 400 });
       if (body.advance && body.data.rightsConfirmed !== true) return Response.json({ error: "必须确认素材使用权" }, { status: 400 });
       Object.assign(input, body.data, { ratio: "9:16" });
       draftStep = "settings";

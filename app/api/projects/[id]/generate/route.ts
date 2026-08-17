@@ -1,7 +1,7 @@
 import { and, eq } from "drizzle-orm";
 import { ensureDatabase, getDb } from "@/db";
 import { projects, uploads } from "@/db/schema";
-import { submitPipeline, type PipelineInput } from "@/lib/pipeline";
+import { pipelineInfo, submitPipeline, type PipelineInput } from "@/lib/pipeline";
 
 export const dynamic = "force-dynamic";
 
@@ -52,15 +52,18 @@ export async function POST(request: Request, context: { params: Promise<{ id: st
     }
 
     const snapshot = await submitPipeline({ ...input, projectId: id, title: row.title });
+    const runMode = pipelineInfo().mode;
     const now = new Date().toISOString();
     const [updated] = await db.update(projects).set({
       status: snapshot.status,
+      runMode,
       draftStep: "locked",
       draftVersion: row.draftVersion + 1,
       progress: snapshot.progress,
       providerJobId: snapshot.providerJobId ?? null,
       resultJson: snapshot.result ? JSON.stringify(snapshot.result) : null,
       errorJson: snapshot.error ? JSON.stringify(snapshot.error) : null,
+      pipelineJson: snapshot.state ? JSON.stringify(snapshot.state) : null,
       runStartedAt: now,
       updatedAt: now,
     }).where(and(eq(projects.id, id), eq(projects.ownerId, owner), eq(projects.status, "draft"), eq(projects.draftVersion, row.draftVersion))).returning();

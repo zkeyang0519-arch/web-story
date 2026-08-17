@@ -42,6 +42,7 @@ async function bootstrapDatabase() {
       input_json TEXT NOT NULL,
       result_json TEXT,
       error_json TEXT,
+      pipeline_json TEXT,
       created_at TEXT NOT NULL,
       updated_at TEXT NOT NULL
     )`),
@@ -65,6 +66,7 @@ async function bootstrapDatabase() {
     "ALTER TABLE projects ADD COLUMN draft_step TEXT DEFAULT 'references' NOT NULL",
     "ALTER TABLE projects ADD COLUMN draft_version INTEGER DEFAULT 1 NOT NULL",
     "ALTER TABLE projects ADD COLUMN run_started_at TEXT",
+    "ALTER TABLE projects ADD COLUMN pipeline_json TEXT",
     "ALTER TABLE uploads ADD COLUMN project_id TEXT",
     "ALTER TABLE uploads ADD COLUMN multipart_upload_id TEXT",
   ]) {

@@ -9,7 +9,7 @@
 - D1 持久化项目与上传记录
 - R2 存储参考视频与成片
 - 参考视频采用 R2 分片上传，不设置 200 MB 的应用层大小上限
-- 统一管线适配器：无生产配置时使用可识别的演示模式；配置内部编排服务后自动切换生产模式
+- 统一管线适配器：无生产配置时使用可识别的演示模式；配置火山方舟 Key 后自动切换真实模式
 - 默认成片规格：9:16、1080 × 1920、24 fps、Seedance 2.0 Standard
 - 内部私有部署，不在浏览器保存供应商密钥
 
@@ -31,10 +31,11 @@ npm test
 
 ## 生产管线配置
 
-站点通过服务端环境变量连接独立编排服务：
+站点通过服务端环境变量直接连接火山方舟：
 
-- `VIDEO_PROVIDER=seedance`
-- `PIPELINE_API_URL`
-- `PIPELINE_API_TOKEN`
+- `ARK_API_KEY`（必填，仅服务端 Secret）
+- `ARK_ANALYSIS_MODEL`（可选，默认 `doubao-seed-2-0-lite-260428`）
+- `ARK_REVIEW_MODEL`（可选，默认 `doubao-seed-2-1-pro-260628`）
+- `ARK_VIDEO_MODEL`（可选，默认 `doubao-seedance-2-0-260128`）
 
-编排服务应实现 `POST /v1/runs` 与 `GET /v1/runs/:id`，并负责 MiMo/Qwen 参考解析、Seedream 素材生成、Seedance 2.0 任务、回调对账、质检、归档与成本回填。Web 层只消费统一状态，不直接持有供应商协议细节。
+真实模式会把上传的视频流式送入方舟 Files API，由视觉模型逐条解析，使用复核模型收敛一个原创创意，再异步提交 Seedance 2.0 Standard。成片成功后立即归档到 R2，并按方舟返回的 token 用量回填平台成本。
