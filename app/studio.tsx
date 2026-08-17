@@ -24,6 +24,21 @@ type ReferenceItem = {
 };
 
 type ActivityEvent = { id: string; phase: string; message: string; createdAt: string; level?: "info" | "success" | "warning" | "error" };
+type DiagnosticLog = {
+  id: string;
+  createdAt: string;
+  stage: string;
+  operation: string;
+  status: string;
+  message: string;
+  model?: string;
+  durationMs?: number;
+  providerResponseId?: string;
+  providerStatus?: string;
+  errorCode?: string;
+  validationErrors?: string[];
+  responseExcerpt?: string;
+};
 
 type ProjectResult = {
   videoUrl?: string;
@@ -55,6 +70,8 @@ type Project = {
     message: string;
     attempts: Array<{ model: string; strategy: string; status: string; errors: string[]; createdAt: string }>;
   } | null;
+  stepRecovery?: { retryable: boolean; stage: string; resumePhase: string; failedAt: string; message: string; model?: string } | null;
+  diagnostics?: DiagnosticLog[];
   createdAt: string;
   updatedAt: string;
   input: {
@@ -550,6 +567,42 @@ export function Studio({ view = "references", projectId }: { view?: StudioView; 
     }
   }
 
+  async function retryCurrentStep() {
+    if (!project || !["needs_action", "failed"].includes(project.status)) return;
+    setSubmitting(true);
+    setMessage("");
+    try {
+      const response = await fetch(`/api/projects/${project.id}/retry-step`, { method: "POST" });
+      const data = await response.json().catch(() => null) as { project?: Project; error?: string } | null;
+      if (!response.ok || !data?.project) throw new Error(data?.error ?? "无法重新启动当前步骤");
+      setProject(data.project);
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "当前步骤重试失败");
+    } finally {
+      setSubmitting(false);
+    }
+  }
+
+  function downloadProcessLog() {
+    if (!project) return;
+    const payload = {
+      projectId: project.id,
+      status: project.status,
+      phase: project.pipelinePhase,
+      error: project.error,
+      activity: project.activity ?? [],
+      diagnostics: project.diagnostics ?? [],
+      exportedAt: new Date().toISOString(),
+    };
+    const blob = new Blob([JSON.stringify(payload, null, 2)], { type: "application/json" });
+    const url = URL.createObjectURL(blob);
+    const anchor = document.createElement("a");
+    anchor.href = url;
+    anchor.download = `jingliu-${project.id.slice(0, 8)}-process-log.json`;
+    anchor.click();
+    URL.revokeObjectURL(url);
+  }
+
   function resetProduction() {
     setProject(null);
     setIsPlaying(true);
@@ -595,8 +648,13 @@ export function Studio({ view = "references", projectId }: { view?: StudioView; 
     (project.status === "needs_action" && project.pipelinePhase === "creative_recovery")
     || (project.status === "failed" && project.pipelinePhase === "synthesizing" && project.error?.code === "ArkPipelineError")
   ));
-  const isStopped = Boolean(project && ["failed", "cancelled"].includes(project.status) && !needsCreativeRecovery);
-  const isPaused = isStopped || needsCreativeRecovery;
+  const recoverableStepPhases = ["waiting_file", "planning_images", "reviewing_images", "reviewing_video"];
+  const needsStepRecovery = Boolean(project && (
+    (project.status === "needs_action" && project.stepRecovery?.retryable)
+    || (project.status === "failed" && recoverableStepPhases.includes(project.pipelinePhase ?? "") && ["ArkPipelineError", "StructuredOutputInvalid"].includes(project.error?.code ?? ""))
+  ));
+  const isStopped = Boolean(project && ["failed", "cancelled"].includes(project.status) && !needsCreativeRecovery && !needsStepRecovery);
+  const isPaused = isStopped || needsCreativeRecovery || needsStepRecovery;
   const currentProcessIndex = project?.status === "completed" ? processSteps.length : Math.max(0, processSteps.findIndex((step) => (project?.progress ?? 0) < step.end));
   const processDoneCount = project?.status === "completed" ? processSteps.length : currentProcessIndex;
   const currentCopy = project ? statusCopy(project.status) : statusCopy("ingesting");
@@ -637,14 +695,15 @@ export function Studio({ view = "references", projectId }: { view?: StudioView; 
           <div>
             <button className="text-button" onClick={() => router.push("/")}>← 返回制片单</button>
             <p className="eyebrow">任务 {project.id.slice(0, 8).toUpperCase()}</p>
-            <h1>{needsCreativeRecovery ? "创意融合需要重新处理" : isStopped ? project.status === "cancelled" ? "任务已结束" : "制作已停止" : "正在制作视频"}</h1>
-            <p>{needsCreativeRecovery ? `${project.input.references.length}条参考视频解析已经保留；重试不会重新上传或重新解析素材。` : isStopped ? "系统已停止后续步骤，请查看错误并重新输入。" : "任务会在后台继续运行，你可以安全离开此页面。"}</p>
+            <h1>{needsCreativeRecovery ? "创意融合需要重新处理" : needsStepRecovery ? `${project.stepRecovery?.stage ?? "当前步骤"}需要重新处理` : isStopped ? project.status === "cancelled" ? "任务已结束" : "制作已停止" : "正在制作视频"}</h1>
+            <p>{needsCreativeRecovery ? `${project.input.references.length}条参考视频解析已经保留；重试不会重新上传或重新解析素材。` : needsStepRecovery ? "已完成的上游素材和确认结果全部保留；重试只执行当前失败步骤。" : isStopped ? "系统已停止后续步骤，请查看错误并重新输入。" : "任务会在后台继续运行，你可以安全离开此页面。"}</p>
           </div>
-          <div className={`run-chip ${isPaused ? "stopped" : ""}`}><span className="live-dot" /> {needsCreativeRecovery ? "等待重试" : isStopped ? "任务已停止" : project.runMode === "demo" ? "演示管线" : "生产管线"}</div>
+          <div className={`run-chip ${isPaused ? "stopped" : ""}`}><span className="live-dot" /> {needsCreativeRecovery || needsStepRecovery ? "等待重试" : isStopped ? "任务已停止" : project.runMode === "demo" ? "演示管线" : "生产管线"}</div>
         </section>
 
         {isStopped && <section className="run-error wrap" role="alert"><div><span>{project.status === "cancelled" ? "CANCELLED" : "FAILED"}</span><strong>{project.error?.message || (project.status === "cancelled" ? "任务已由用户结束" : "制作过程中发生错误")}</strong><p>不会继续执行任何后续模型任务。请重新检查素材、链接或创作要求后再提交。</p></div><button onClick={() => router.push("/")}>重新输入并创建新任务 →</button></section>}
         {needsCreativeRecovery && <section className="run-error recovery-error wrap" role="alert"><div><span>CREATIVE RECOVERY</span><strong>{project.error?.message || project.recovery?.message || "创意融合没有通过结构校验"}</strong><p>单条视频解析结果不会丢失；系统将只重试创意融合，最多执行“同模型修复 + 备用模型”三层兜底。</p>{message && <p className="recovery-message">{message}</p>}{project.recovery?.attempts?.length ? <details className="recovery-attempts"><summary>查看模型与字段错误</summary>{project.recovery.attempts.map((attempt, index) => <div key={`${attempt.createdAt}-${index}`}><b>{attempt.model}</b><span>{attempt.strategy} · {attempt.status}</span>{attempt.errors.slice(0, 5).map((error) => <code key={error}>{error}</code>)}</div>)}</details> : null}</div><button disabled={submitting} onClick={() => void retryCreativeOnly()}>{submitting ? "正在恢复融合…" : "仅重试创意融合 →"}</button></section>}
+        {needsStepRecovery && <section className="run-error recovery-error wrap" role="alert"><div><span>STEP RECOVERY</span><strong>{project.error?.message || project.stepRecovery?.message || "当前步骤没有返回可用结果"}</strong><p>失败阶段：{project.stepRecovery?.stage ?? project.pipelinePhase}；模型：{project.stepRecovery?.model ?? project.error?.model ?? "历史任务未记录具体模型"}。详细响应见右侧“流程诊断日志”。</p>{message && <p className="recovery-message">{message}</p>}</div><button disabled={submitting} onClick={() => void retryCurrentStep()}>{submitting ? "正在恢复步骤…" : "仅重试当前步骤 →"}</button></section>}
 
         <section className="monitor-grid wrap">
           <aside className="stage-rail" aria-label="制作阶段">
@@ -687,21 +746,23 @@ export function Studio({ view = "references", projectId }: { view?: StudioView; 
             </dl>
             <div className="status-note">
                <span className="note-mark">{isPaused ? "!" : project.status === "quality_checking" ? "↻" : "i"}</span>
-               <p>{needsCreativeRecovery ? "参考解析已安全保留。点击上方按钮后，只会重试创意融合，不会重复产生视频解析费用。" : isStopped ? "任务已经终止，不会继续执行后续模型步骤。请返回重新检查输入后创建新任务。" : project.status === "quality_checking" ? "正在做交付前硬质检；主题跑偏、主体漂移或命中禁项都会停止交付。" : "现在不需要操作。制作完成后会自动进入交付页。"}</p>
+               <p>{needsCreativeRecovery ? "参考解析已安全保留。点击上方按钮后，只会重试创意融合，不会重复产生视频解析费用。" : needsStepRecovery ? "当前步骤已暂停。下载诊断日志可查看阶段、模型、响应状态、字段错误和脱敏后的模型原文片段。" : isStopped ? "任务已经终止，不会继续执行后续模型步骤。请返回重新检查输入后创建新任务。" : project.status === "quality_checking" ? "正在做交付前硬质检；主题跑偏、主体漂移或命中禁项都会停止交付。" : "现在不需要操作。制作完成后会自动进入交付页。"}</p>
              </div>
              <div className="live-stream" aria-live="polite">
-               <div className="stream-head"><span>实时输出</span><i>{needsCreativeRecovery ? "PAUSED" : isStopped ? "STOPPED" : "LIVE"}</i></div>
+               <div className="stream-head"><span>实时输出</span><i>{needsCreativeRecovery || needsStepRecovery ? "PAUSED" : isStopped ? "STOPPED" : "LIVE"}</i></div>
                <div className="stream-lines">
                  {activity.slice(-10).map((event) => <div className={`stream-line ${event.level ?? "info"}`} key={event.id}><time>{new Date(event.createdAt).toLocaleTimeString("zh-CN", { hour12: false, hour: "2-digit", minute: "2-digit", second: "2-digit" })}</time><p>{event.message}</p></div>)}
                  {!isPaused && <div className="stream-cursor"><span />等待下一条状态更新</div>}
                </div>
              </div>
             <details className="diagnostics">
-              <summary>管理员诊断</summary>
-              <div><span>生成模型</span><strong>{modelLabel}</strong></div>
-              <div><span>任务模式</span><strong>{project.runMode === "demo" ? "Mock Provider" : "Volcengine"}</strong></div>
-              <div><span>状态码</span><strong>{project.status}</strong></div>
-            </details>
+               <summary>流程诊断日志 · {project.diagnostics?.length ?? 0} 条</summary>
+               <div><span>生成模型</span><strong>{modelLabel}</strong></div>
+               <div><span>任务模式</span><strong>{project.runMode === "demo" ? "Mock Provider" : "Volcengine"}</strong></div>
+               <div><span>状态码</span><strong>{project.status}</strong></div>
+               {(project.diagnostics ?? []).slice(-10).map((log) => <article className="diagnostic-entry" key={log.id}><header><b>{log.stage}</b><time>{new Date(log.createdAt).toLocaleString("zh-CN", { hour12: false })}</time></header><p>{log.message}</p><dl><div><dt>模型</dt><dd>{log.model ?? "未记录"}</dd></div><div><dt>状态</dt><dd>{log.providerStatus ?? log.status}</dd></div>{typeof log.durationMs === "number" && <div><dt>耗时</dt><dd>{log.durationMs} ms</dd></div>}{log.errorCode && <div><dt>错误码</dt><dd>{log.errorCode}</dd></div>}</dl>{log.validationErrors?.map((error) => <code key={error}>{error}</code>)}{log.responseExcerpt && <details><summary>模型原文片段</summary><pre>{log.responseExcerpt}</pre></details>}</article>)}
+               <button className="log-download" onClick={downloadProcessLog}>下载完整流程日志 JSON</button>
+             </details>
           </aside>
         </section>
 

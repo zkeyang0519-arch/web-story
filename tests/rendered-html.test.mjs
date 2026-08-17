@@ -77,3 +77,22 @@ test("recovers creative fusion without repeating video analysis", async () => {
   assert.match(retryRoute, /retryCreativeSynthesis/);
   assert.match(studio, /仅重试创意融合/);
 });
+
+test("persists structured-output diagnostics and supports step-only recovery", async () => {
+  const [pipeline, retryRoute, projectView, studio] = await Promise.all([
+    readFile(new URL("../lib/pipeline.ts", import.meta.url), "utf8"),
+    readFile(new URL("../app/api/projects/[id]/retry-step/route.ts", import.meta.url), "utf8"),
+    readFile(new URL("../lib/project-view.ts", import.meta.url), "utf8"),
+    readFile(new URL("../app/studio.tsx", import.meta.url), "utf8"),
+  ]);
+  assert.match(pipeline, /PipelineDiagnosticLog/);
+  assert.match(pipeline, /responseExcerpt/);
+  assert.match(pipeline, /providerResponseId/);
+  assert.match(pipeline, /IMAGE_PLAN_TOOL_NAME = "submit_image_plan"/);
+  assert.match(pipeline, /retryRecoverableStep/);
+  assert.match(retryRoute, /retryRecoverableStep/);
+  assert.match(projectView, /visibleDiagnostics/);
+  assert.match(studio, /流程诊断日志/);
+  assert.match(studio, /下载完整流程日志 JSON/);
+  assert.match(studio, /仅重试当前步骤/);
+});

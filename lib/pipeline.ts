@@ -73,6 +73,23 @@ export type CreativeAttempt = {
   rawExcerpt?: string;
 };
 
+export type PipelineDiagnosticLog = {
+  id: string;
+  createdAt: string;
+  stage: string;
+  operation: string;
+  status: "started" | "succeeded" | "invalid" | "request_error";
+  message: string;
+  model?: string;
+  attempt?: number;
+  durationMs?: number;
+  providerResponseId?: string;
+  providerStatus?: string;
+  errorCode?: string;
+  validationErrors?: string[];
+  responseExcerpt?: string;
+};
+
 export type StoryboardFrame = {
   id: string;
   order: number;
@@ -148,6 +165,15 @@ export type ArkPipelineState = {
     failedAt: string;
     message: string;
   };
+  stepRecovery?: {
+    retryable: true;
+    stage: string;
+    resumePhase: ArkPipelineState["phase"];
+    failedAt: string;
+    message: string;
+    model?: string;
+  };
+  diagnostics?: PipelineDiagnosticLog[];
   imagePlan?: ImagePlan;
   storyboardImages?: StoryboardImage[];
   imageQuality?: QualityReport;
@@ -207,6 +233,16 @@ class CreativeSynthesisFailure extends Error {
     super(message);
     this.name = "CreativeSynthesisFailure";
     this.attempts = attempts;
+  }
+}
+
+class PipelineStepFailure extends Error {
+  diagnostic: PipelineDiagnosticLog;
+
+  constructor(message: string, diagnostic: Omit<PipelineDiagnosticLog, "id" | "createdAt">) {
+    super(message);
+    this.name = "PipelineStepFailure";
+    this.diagnostic = { ...diagnostic, id: crypto.randomUUID(), createdAt: new Date().toISOString() };
   }
 }
 
@@ -317,6 +353,34 @@ export async function readPipeline(args: {
           stage: "creative_synthesis",
           model: error.attempts.at(-1)?.model ?? arkConfig().reviewModel,
           attempts: error.attempts.length,
+        },
+      };
+    }
+    if (error instanceof PipelineStepFailure) {
+      const message = `${error.diagnostic.stage}未返回可用的结构化结果；当前阶段已暂停，可查看诊断日志后仅重试本步骤`;
+      const recoveryState = withEvent({
+        ...args.state,
+        diagnostics: appendDiagnostic(args.state.diagnostics, error.diagnostic),
+        stepRecovery: {
+          retryable: true,
+          stage: error.diagnostic.stage,
+          resumePhase: args.state.phase,
+          failedAt: new Date().toISOString(),
+          message,
+          model: error.diagnostic.model,
+        },
+      }, "step_recovery", message, "error");
+      return {
+        status: "needs_action",
+        progress: progressForPhase(args.state.phase),
+        state: recoveryState,
+        error: {
+          code: "StructuredOutputInvalid",
+          message,
+          recoverable: true,
+          stage: error.diagnostic.stage,
+          model: error.diagnostic.model,
+          attempts: 1,
         },
       };
     }
@@ -565,6 +629,29 @@ export function retryCreativeSynthesis(state: ArkPipelineState): PipelineSnapsho
   };
 }
 
+export function retryRecoverableStep(state: ArkPipelineState): PipelineSnapshot {
+  const allowed = new Set<ArkPipelineState["phase"]>(["waiting_file", "planning_images", "reviewing_images", "reviewing_video"]);
+  const legacyStructuredFailure = allowed.has(state.phase);
+  if ((!state.stepRecovery?.retryable && !legacyStructuredFailure) || !allowed.has(state.phase)) {
+    throw new Error("当前任务没有可单独重试的流程步骤");
+  }
+  const statusByPhase: Partial<Record<ArkPipelineState["phase"], PipelineStatus>> = {
+    waiting_file: "ingesting",
+    planning_images: "generating_assets",
+    reviewing_images: "quality_checking",
+    reviewing_video: "quality_checking",
+  };
+  return {
+    status: statusByPhase[state.phase] ?? "needs_action",
+    progress: progressForPhase(state.phase),
+    state: withEvent({
+      ...state,
+      revision: (state.revision ?? 1) + 1,
+      stepRecovery: undefined,
+    }, "step_retry", `仅重新执行“${state.stepRecovery?.stage ?? phaseLabel(state.phase)}”，已完成的上游结果保持不变`, "info"),
+  };
+}
+
 function nextReferenceState(input: PipelineInput, state: ArkPipelineState, analysis: Record<string, unknown>): PipelineSnapshot {
   const nextIndex = state.referenceIndex + 1;
   return {
@@ -635,18 +722,24 @@ async function analyzeReference(source: { fileId?: string; videoUrl?: string }, 
   const prompt = `你是短视频导演和广告创意分析师。完整观看并分析这条参考视频，只记录画面或声音中有证据的内容，只提取可迁移的创意机制，禁止复刻人物、品牌、台词或受版权保护的表达。
 请只输出一个合法 JSON 对象，不要 Markdown。字段必须包括：summary（50-200字）、timeline_beats（数组）、hook、creative_mechanism、visual_grammar、camera_and_motion、pacing、audio_design、emotion_curve、reusable_techniques（数组）、seedance_prompt_fragments（数组）、quality_risks（数组）、confidence（0到1）。禁止根据标题或常识补写视频中没有出现的内容。
 参考序号：${index + 1}；用户标注重点：${JSON.stringify(reference.emphasis ?? [])}；是否重点参考：${Boolean(reference.priority)}。`;
+  const model = arkConfig().analysisModel;
+  const startedAt = Date.now();
   const response = await arkRequest<ArkResponse>("/responses", {
     method: "POST",
     headers: { "content-type": "application/json" },
     body: JSON.stringify({
-      model: arkConfig().analysisModel,
+      model,
       input: [{ type: "message", role: "user", content: [media, { type: "input_text", text: prompt }] }],
       max_output_tokens: 1800,
       thinking: { type: "disabled" },
     }),
   });
-  const parsed = parseModelJson(responseText(response));
-  return normalizeReferenceAnalysis(parsed, index, reference);
+  return parseStructuredResponse(response, {
+    stage: `参考视频 ${index + 1} 解析`,
+    operation: "reference_analysis",
+    model,
+    startedAt,
+  }, (parsed) => normalizeReferenceAnalysis(parsed, index, reference));
 }
 
 const CREATIVE_TOOL_NAME = "submit_creative_card";
@@ -840,22 +933,65 @@ function extractCreativeCandidate(response: ArkResponse): { raw: string; value?:
   return parsed.value ? { raw, value: parsed.value, errors: [] } : { raw, errors: [parsed.error ?? "返回内容不是合法 JSON"] };
 }
 
+const IMAGE_PLAN_TOOL_NAME = "submit_image_plan";
+const IMAGE_PLAN_TOOL = {
+  type: "function",
+  name: IMAGE_PLAN_TOOL_NAME,
+  description: "提交严格4张、时间连续的9:16分镜图片提示词方案",
+  parameters: {
+    type: "object",
+    additionalProperties: false,
+    required: ["continuity_anchor", "frames"],
+    properties: {
+      continuity_anchor: { type: "string" },
+      frames: {
+        type: "array",
+        minItems: 4,
+        maxItems: 4,
+        items: {
+          type: "object",
+          additionalProperties: false,
+          required: ["order", "time_range", "title", "narrative_goal", "prompt", "motion"],
+          properties: {
+            order: { type: "integer", minimum: 1, maximum: 4 },
+            time_range: { type: "string" },
+            title: { type: "string" },
+            narrative_goal: { type: "string" },
+            prompt: { type: "string" },
+            motion: { type: "string" },
+          },
+        },
+      },
+    },
+  },
+} as const;
+
 async function planStoryboardImages(input: PipelineInput, creative: CreativeCard, analyses: Array<Record<string, unknown>>): Promise<ImagePlan> {
   const prompt = `你是电影分镜导演和 Seedream 图片提示词专家。根据已经由用户确认的参考解析和唯一创意，为15秒9:16短视频规划严格4张、角色与美术连续的关键分镜图。四张图必须共同覆盖开场钩子、发展、转折和收束，不得改变主题、产品、受众、风格或必备内容。用户确认后的文本优先级最高。
 用户简报：${JSON.stringify({ topic: input.topic, goal: input.goal, audience: input.audience, style: input.style, company: input.company, mustInclude: input.mustInclude, mustAvoid: input.mustAvoid, cta: input.cta })}
 用户确认后的参考解析：${JSON.stringify(analyses)}
 已确认创意：${JSON.stringify(creative)}
-只输出合法 JSON，不要 Markdown。格式：{"continuity_anchor":"每张图都必须复用的主体身份、服装、产品、场景基调、色彩与光线描述","frames":[{"order":1,"time_range":"0-3秒","title":"镜头标题","narrative_goal":"该画面在故事中的作用","prompt":"可直接用于生成单张9:16高质量分镜图的完整中文提示词，严格遵循已确认视觉风格，写清主体、动作、环境、构图、镜头、光线；禁止无关文字、水印和拼图","motion":"后续视频中该画面的主体动作与运镜"}]}。frames 必须恰好4项，order必须为1到4，时间段必须连续覆盖0到15秒。`;
+你必须调用 ${IMAGE_PLAN_TOOL_NAME}，不得输出普通文本或 Markdown。frames 必须恰好4项，order必须为1到4，时间段必须连续覆盖0到15秒。`;
+  const model = arkConfig().reviewModel;
+  const startedAt = Date.now();
   const response = await arkRequest<ArkResponse>("/responses", {
     method: "POST",
     headers: { "content-type": "application/json" },
     body: JSON.stringify({
-      model: arkConfig().reviewModel,
+      model,
       input: prompt,
-      max_output_tokens: 2800,
+      tools: [IMAGE_PLAN_TOOL],
+      max_output_tokens: 5000,
+      thinking: { type: "disabled" },
     }),
   });
-  return normalizeImagePlan(parseModelJson(responseText(response)));
+  return parseStructuredResponse(response, {
+    stage: "4张分镜图片提示词规划",
+    operation: "image_prompt_planning",
+    model,
+    startedAt,
+    toolName: IMAGE_PLAN_TOOL_NAME,
+  }, normalizeImagePlan);
 }
 
 async function generateStoryboardImages(
@@ -909,17 +1045,24 @@ async function reviewStoryboardImages(input: PipelineInput, creative: CreativeCa
 已确认创意：${JSON.stringify(creative)}
 已确认图片方案：${JSON.stringify(imagePlan)}
 只输出合法JSON：{"passed":true,"brief_alignment":0.0,"visual_consistency":0.0,"constraint_coverage":0.0,"issues":[],"summary":"结论"}。三个分数范围0到1；只有全部分数不低于0.78且没有硬问题时 passed 才能为 true。`;
+  const model = arkConfig().analysisModel;
+  const startedAt = Date.now();
   const response = await arkRequest<ArkResponse>("/responses", {
     method: "POST",
     headers: { "content-type": "application/json" },
     body: JSON.stringify({
-      model: arkConfig().analysisModel,
+      model,
       input: [{ type: "message", role: "user", content: [...media, { type: "input_text", text: prompt }] }],
       max_output_tokens: 1200,
       thinking: { type: "disabled" },
     }),
   });
-  return normalizeQualityReport(parseModelJson(responseText(response)), 0.78);
+  return parseStructuredResponse(response, {
+    stage: "分镜图片质量检查",
+    operation: "storyboard_quality_review",
+    model,
+    startedAt,
+  }, (parsed) => normalizeQualityReport(parsed, 0.78));
 }
 
 async function reviewFinalVideo(
@@ -935,17 +1078,24 @@ async function reviewFinalVideo(
 已确认图片方案：${JSON.stringify(imagePlan)}
 已确认画布：${JSON.stringify(canvas)}
 只输出合法JSON：{"passed":true,"brief_alignment":0.0,"visual_consistency":0.0,"constraint_coverage":0.0,"issues":[],"summary":"结论"}。三个分数范围0到1；只有全部分数不低于0.8且没有硬问题时 passed 才能为 true。`;
+  const model = arkConfig().analysisModel;
+  const startedAt = Date.now();
   const response = await arkRequest<ArkResponse>("/responses", {
     method: "POST",
     headers: { "content-type": "application/json" },
     body: JSON.stringify({
-      model: arkConfig().analysisModel,
+      model,
       input: [{ type: "message", role: "user", content: [{ type: "input_video", video_url: videoUrl }, { type: "input_text", text: prompt }] }],
       max_output_tokens: 1400,
       thinking: { type: "disabled" },
     }),
   });
-  return normalizeQualityReport(parseModelJson(responseText(response)), 0.8);
+  return parseStructuredResponse(response, {
+    stage: "最终成片质量检查",
+    operation: "video_quality_review",
+    model,
+    startedAt,
+  }, (parsed) => normalizeQualityReport(parsed, 0.8));
 }
 
 async function createSeedanceTask(
@@ -1040,6 +1190,60 @@ function responseText(response: ArkResponse) {
     .filter((item) => item.type === "output_text" && item.text)
     .map((item) => item.text)
     .join("\n");
+}
+
+function parseStructuredResponse<T>(
+  response: ArkResponse,
+  context: { stage: string; operation: string; model: string; startedAt: number; toolName?: string },
+  normalize: (value: Record<string, unknown>) => T,
+) {
+  const toolCall = context.toolName
+    ? (response.output ?? []).find((item) => item.type === "function_call" && item.name === context.toolName)
+    : null;
+  const raw = toolCall
+    ? typeof toolCall.arguments === "string" ? toolCall.arguments : JSON.stringify(toolCall.arguments ?? {})
+    : responseText(response);
+  const common = {
+    stage: context.stage,
+    operation: context.operation,
+    model: context.model,
+    durationMs: Date.now() - context.startedAt,
+    providerResponseId: response.id,
+    providerStatus: response.status,
+    responseExcerpt: clipText(raw, 4000),
+  };
+  if (response.status && response.status !== "completed") {
+    const reason = response.incomplete_details?.reason ?? response.status;
+    throw new PipelineStepFailure(`模型响应未完成：${reason}`, {
+      ...common,
+      status: "invalid",
+      message: `模型响应未完成：${reason}`,
+      errorCode: "MODEL_RESPONSE_INCOMPLETE",
+      validationErrors: [`响应状态：${response.status}`, `原因：${reason}`],
+    });
+  }
+  const parsed = tryParseModelJson(raw);
+  if (!parsed.value) {
+    throw new PipelineStepFailure(parsed.error ?? "返回内容不是合法 JSON", {
+      ...common,
+      status: "invalid",
+      message: parsed.error ?? "返回内容不是合法 JSON",
+      errorCode: "INVALID_JSON",
+      validationErrors: [parsed.error ?? "返回内容不是合法 JSON"],
+    });
+  }
+  try {
+    return normalize(parsed.value);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "结构字段校验失败";
+    throw new PipelineStepFailure(message, {
+      ...common,
+      status: "invalid",
+      message,
+      errorCode: "SCHEMA_VALIDATION_FAILED",
+      validationErrors: [message],
+    });
+  }
 }
 
 function objectValue(value: unknown): Record<string, unknown> {
@@ -1349,13 +1553,7 @@ function tryParseModelJson(text: string): { value?: Record<string, unknown>; err
   }
 }
 
-function parseModelJson(text: string): Record<string, unknown> {
-  const parsed = tryParseModelJson(text);
-  if (parsed.value) return parsed.value;
-  throw new Error(parsed.error ?? "模型未返回合法的结构化结果");
-}
-
-function failure(code: string, message: string, state?: ArkPipelineState): PipelineSnapshot {
+function progressForPhase(phase: ArkPipelineState["phase"]) {
   const progressByPhase: Record<ArkPipelineState["phase"], number> = {
     ingesting: 12,
     waiting_file: 18,
@@ -1371,7 +1569,25 @@ function failure(code: string, message: string, state?: ArkPipelineState): Pipel
     polling_video: 88,
     reviewing_video: 96,
   };
-  return { status: "failed", progress: state ? progressByPhase[state.phase] : 0, state: state ? withEvent(state, "failed", `任务中断：${message}`, "error") : state, error: { code, message } };
+  return progressByPhase[phase];
+}
+
+function phaseLabel(phase: ArkPipelineState["phase"]) {
+  const labels: Partial<Record<ArkPipelineState["phase"], string>> = {
+    waiting_file: "参考视频解析",
+    planning_images: "4张分镜图片提示词规划",
+    reviewing_images: "分镜图片质量检查",
+    reviewing_video: "最终成片质量检查",
+  };
+  return labels[phase] ?? phase;
+}
+
+function appendDiagnostic(logs: PipelineDiagnosticLog[] | undefined, entry: PipelineDiagnosticLog) {
+  return [...(logs ?? []), entry].slice(-100);
+}
+
+function failure(code: string, message: string, state?: ArkPipelineState): PipelineSnapshot {
+  return { status: "failed", progress: state ? progressForPhase(state.phase) : 0, state: state ? withEvent(state, "failed", `任务中断：${message}`, "error") : state, error: { code, message } };
 }
 
 async function cancelArkTask(taskId: string) {

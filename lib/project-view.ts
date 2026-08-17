@@ -7,6 +7,19 @@ type LegacyPipeline = ArkPipelineState & {
 
 export function presentProject(row: typeof projects.$inferSelect) {
   const pipeline = row.pipelineJson ? JSON.parse(row.pipelineJson) as LegacyPipeline : null;
+  const error = row.errorJson ? JSON.parse(row.errorJson) as { code?: string; message?: string; model?: string; stage?: string } : null;
+  const diagnostics = pipeline?.diagnostics ?? [];
+  const visibleDiagnostics = diagnostics.length || !error ? diagnostics : [{
+    id: `legacy-${row.id}-${row.updatedAt}`,
+    createdAt: row.updatedAt,
+    stage: pipeline?.phase ?? error.stage ?? "unknown",
+    operation: "legacy_failure",
+    status: "invalid" as const,
+    message: error.message ?? "历史任务失败",
+    model: error.model,
+    errorCode: error.code,
+    validationErrors: [error.message ?? "历史版本未保存详细字段错误"],
+  }];
   const storyboardImages = (pipeline?.storyboardImages ?? []).map((image) => ({
     frameId: image.frameId,
     order: image.order,
@@ -45,8 +58,10 @@ export function presentProject(row: typeof projects.$inferSelect) {
         createdAt: attempt.createdAt,
       })),
     } : null,
+    stepRecovery: pipeline?.stepRecovery ?? null,
+    diagnostics: visibleDiagnostics,
     activity: pipeline?.events ?? [],
-    error: row.errorJson ? JSON.parse(row.errorJson) : null,
+    error,
     createdAt: row.runStartedAt ?? row.createdAt,
     updatedAt: row.updatedAt,
     input: JSON.parse(row.inputJson),
