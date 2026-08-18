@@ -1,9 +1,14 @@
 import { and, eq } from "drizzle-orm";
 import { ensureDatabase, getDb } from "@/db";
 import { projects, uploads } from "@/db/schema";
-import { readPipeline, type ArkPipelineState, type PipelineInput } from "@/lib/pipeline";
+import { hydratePipelineInput, readPipeline, type ArkPipelineState } from "@/lib/pipeline";
 import { calculateCostQuote } from "@/lib/cost";
 import { presentProject } from "@/lib/project-view";
+import {
+  VIDEO_DURATION_OPTIONS,
+  validateVideoSpec,
+  type VideoSpec,
+} from "@/lib/video-config";
 
 export const dynamic = "force-dynamic";
 
@@ -16,6 +21,24 @@ type PatchDraftBody = {
 
 function ownerId(request: Request) {
   return request.headers.get("oai-authenticated-user-id") ?? "local-preview";
+}
+
+function savedVideoSpec(input: Record<string, unknown>): VideoSpec {
+  const validation = validateVideoSpec({
+    duration: typeof input.duration === "number" ? input.duration : 15,
+    videoModel: typeof input.videoModel === "string" ? input.videoModel : "seedance-2.0-standard",
+    ratio: typeof input.ratio === "string" ? input.ratio : "9:16",
+    resolution: typeof input.resolution === "string" ? input.resolution : "1080p",
+    fps: typeof input.fps === "number" ? input.fps : 24,
+  });
+  if (validation.ok) return validation.spec;
+  return {
+    duration: 15,
+    videoModel: "seedance-2.0-standard",
+    ratio: "9:16",
+    resolution: "1080p",
+    fps: 24,
+  };
 }
 
 export async function GET(request: Request, context: { params: Promise<{ id: string }> }) {
@@ -43,7 +66,7 @@ export async function GET(request: Request, context: { params: Promise<{ id: str
         if (!acquired) return Response.json({ project: presentProject(row) });
         lockedRow = acquired;
       }
-      const input = { ...JSON.parse(row.inputJson), projectId: row.id, title: row.title } as PipelineInput;
+      const input = hydratePipelineInput(JSON.parse(row.inputJson), row.id, row.title);
       const snapshot = await readPipeline({
         providerJobId: row.providerJobId,
         createdAt: row.runStartedAt ?? row.createdAt,
@@ -124,10 +147,28 @@ export async function PATCH(request: Request, context: { params: Promise<{ id: s
     }
 
     if (body.step === "settings") {
-      if (!["抖音", "小红书"].includes(String(body.data.platform)) || Number(body.data.duration) !== 15 || !String(body.data.style ?? "").trim()) return Response.json({ error: "MVP 当前固定生成 15 秒成片，请检查平台、时长或风格" }, { status: 400 });
+      if (!["抖音", "小红书"].includes(String(body.data.platform)) || !String(body.data.style ?? "").trim()) {
+        return Response.json({ error: "请检查发布平台与画面风格" }, { status: 400 });
+      }
+      const videoSpec = validateVideoSpec({
+        duration: body.data.duration,
+        videoModel: body.data.videoModel,
+        ratio: body.data.ratio,
+        resolution: body.data.resolution,
+        fps: body.data.fps,
+      });
+      if (!videoSpec.ok || !(VIDEO_DURATION_OPTIONS as readonly number[]).includes(Number(body.data.duration))) {
+        const details = videoSpec.ok ? "成片时长不在可选范围内" : videoSpec.errors.join("；");
+        return Response.json({ error: `视频规格无效：${details}` }, { status: 400 });
+      }
       if (body.advance && body.data.rightsConfirmed !== true) return Response.json({ error: "必须确认素材使用权" }, { status: 400 });
-      Object.assign(input, body.data, { ratio: "9:16" });
-      input.quote = calculateCostQuote(Array.isArray(input.references) ? input.references.length : 0, Number(body.data.duration));
+      Object.assign(input, body.data, videoSpec.spec);
+      input.quote = calculateCostQuote(
+        Array.isArray(input.references) ? input.references.length : 0,
+        videoSpec.spec.duration,
+        videoSpec.spec.videoModel,
+        videoSpec.spec.resolution,
+      );
       input.costConfirmed = false;
       delete input.costConfirmedAt;
       draftStep = body.advance ? "quote" : "settings";
@@ -136,7 +177,13 @@ export async function PATCH(request: Request, context: { params: Promise<{ id: s
     if (body.step === "quote") {
       if (row.draftStep !== "quote") return Response.json({ error: "请先完成成片设置并获取成本预估" }, { status: 409 });
       if (body.data.accepted !== true) return Response.json({ error: "请先确认预计平台成本" }, { status: 400 });
-      const quote = calculateCostQuote(Array.isArray(input.references) ? input.references.length : 0, Number(input.duration));
+      const videoSpec = savedVideoSpec(input);
+      const quote = calculateCostQuote(
+        Array.isArray(input.references) ? input.references.length : 0,
+        videoSpec.duration,
+        videoSpec.videoModel,
+        videoSpec.resolution,
+      );
       if (body.data.quoteVersion !== quote.version) return Response.json({ error: "成本预估已更新，请刷新后重新确认" }, { status: 409 });
       input.quote = quote;
       input.costConfirmed = true;

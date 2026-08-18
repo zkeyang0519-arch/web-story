@@ -1,2 +1,19 @@
+# Set this to production to prevent the app from silently falling back to demo data.
+PIPELINE_MODE=
+
+# Required. Create this in the Volcengine Ark console. Never commit the real value.
 ARK_API_KEY=
+
+# Video understanding, creative synthesis, asset revision and multimodal quality review.
+ARK_ANALYSIS_MODEL=
+ARK_REVIEW_MODEL=
+# Optional comma-separated fallback model IDs or Endpoint IDs for creative synthesis.
 ARK_CREATIVE_FALLBACK_MODELS=
+
+# Storyboard image generation.
+ARK_IMAGE_MODEL=
+
+# Video generation model IDs used by the three UI choices.
+ARK_VIDEO_MODEL=
+ARK_VIDEO_MODEL_FAST=
+ARK_VIDEO_MODEL_MINI=

@@ -1,7 +1,7 @@
 import { and, eq } from "drizzle-orm";
 import { ensureDatabase, getDb } from "@/db";
 import { projects, uploads } from "@/db/schema";
-import { pipelineInfo, submitPipeline, type PipelineInput } from "@/lib/pipeline";
+import { hydratePipelineInput, pipelineInfo, submitPipeline, type PipelineInput } from "@/lib/pipeline";
 import { calculateCostQuote, type CostQuote } from "@/lib/cost";
 import { presentProject } from "@/lib/project-view";
 
@@ -28,9 +28,9 @@ export async function POST(request: Request, context: { params: Promise<{ id: st
     if (row.draftVersion !== body.draftVersion) return Response.json({ error: "草稿已更新，请刷新确认后重试" }, { status: 409 });
     if (row.draftStep !== "quote") return Response.json({ error: "请按顺序完成设置并确认预计平台成本" }, { status: 409 });
 
-    const input = JSON.parse(row.inputJson) as PipelineInput & { rightsConfirmed?: boolean; costConfirmed?: boolean; quote?: CostQuote };
+    const input = hydratePipelineInput(JSON.parse(row.inputJson), id, row.title) as PipelineInput & { rightsConfirmed?: boolean; costConfirmed?: boolean; quote?: CostQuote };
     if (!input.rightsConfirmed || !Array.isArray(input.references) || input.references.length < 1 || !input.audience?.trim() || !input.goal?.trim()) return Response.json({ error: "制作信息不完整，请返回前面的步骤检查" }, { status: 400 });
-    const currentQuote = calculateCostQuote(input.references.length, input.duration);
+    const currentQuote = calculateCostQuote(input.references.length, input.duration, input.videoModel, input.resolution);
     if (!input.costConfirmed || input.quote?.version !== currentQuote.version || input.quote.totalMax !== currentQuote.totalMax) {
       return Response.json({ error: "成本尚未确认或预估已经变化，请重新确认" }, { status: 409 });
     }

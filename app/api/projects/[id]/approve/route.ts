@@ -1,7 +1,7 @@
 import { and, eq } from "drizzle-orm";
 import { ensureDatabase, getDb } from "@/db";
 import { projects } from "@/db/schema";
-import { approvePipelineGate, type ArkPipelineState } from "@/lib/pipeline";
+import { approvePipelineGate, hydratePipelineInput, type ArkPipelineState } from "@/lib/pipeline";
 import { presentProject } from "@/lib/project-view";
 
 export const dynamic = "force-dynamic";
@@ -18,11 +18,11 @@ export async function POST(request: Request, context: { params: Promise<{ id: st
     }
     const { id } = await context.params;
     const body = await request.json() as {
-      gate?: "creative" | "image_plan" | "canvas";
+      gate?: "creative" | "image_plan" | "asset_images" | "canvas";
       revision?: number;
       payload?: unknown;
     };
-    if (!body.gate || !["creative", "image_plan", "canvas"].includes(body.gate) || typeof body.revision !== "number" || body.payload == null) {
+    if (!body.gate || !["creative", "image_plan", "asset_images", "canvas"].includes(body.gate) || typeof body.revision !== "number" || body.payload == null) {
       return Response.json({ error: "缺少确认阶段、版本或确认内容" }, { status: 400 });
     }
 
@@ -34,10 +34,16 @@ export async function POST(request: Request, context: { params: Promise<{ id: st
       return Response.json({ error: "当前任务没有等待确认的内容" }, { status: 409 });
     }
     const state = JSON.parse(row.pipelineJson) as ArkPipelineState;
+    const input = hydratePipelineInput(JSON.parse(row.inputJson), row.id, row.title);
     if ((state.revision ?? 1) !== body.revision) {
       return Response.json({ error: "该内容已在其他页面更新，请刷新后再确认" }, { status: 409 });
     }
-    const snapshot = approvePipelineGate({ state, gate: body.gate, payload: body.payload });
+    let snapshot;
+    try {
+      snapshot = approvePipelineGate({ state, input, gate: body.gate, payload: body.payload });
+    } catch (error) {
+      return Response.json({ error: error instanceof Error ? error.message : "确认内容校验失败" }, { status: 422 });
+    }
     if (!snapshot.state) throw new Error("确认后的制作状态缺失");
 
     const [updated] = await db.update(projects).set({

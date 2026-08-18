@@ -1,20 +1,22 @@
 {
-  "name": "jingliu-video-studio",
+  "name": "jingliu-story-asset-studio",
   "version": "0.1.0",
   "private": true,
   "engines": {
     "node": ">=22.13.0"
   },
   "scripts": {
-    "dev": "vinext dev",
+    "dev": "vinext dev --port 3001 --strictPort",
     "build": "vinext build",
     "start": "vinext start",
     "test": "npm run build && node --test tests/rendered-html.test.mjs",
     "lint": "eslint . --ignore-pattern dist --ignore-pattern .next",
+    "production:check": "node scripts/check-production-config.mjs",
     "db:generate": "drizzle-kit generate"
   },
   "dependencies": {
     "drizzle-orm": "0.45.2",
+    "mediabunny": "^1.54.0",
     "react": "19.2.6",
     "react-dom": "19.2.6"
   },
