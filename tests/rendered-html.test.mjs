@@ -144,7 +144,7 @@ test("extracts only two or three highlights per reference and waits for user sel
   assert.match(analysisPrompt, /不要逐秒复述/);
   assert.doesNotMatch(analysisPrompt, /每2秒|每两秒|timeline_segments/);
   assert.match(pipeline, /phase: "awaiting_inspiration_review"/);
-  const nextReferenceStart = pipeline.indexOf("function nextReferenceState");
+  const nextReferenceStart = pipeline.indexOf("function completeReferenceBatch");
   const nextReferenceEnd = pipeline.indexOf("async function uploadVideoToArk", nextReferenceStart);
   const nextReferenceFlow = pipeline.slice(nextReferenceStart, nextReferenceEnd);
   assert.match(nextReferenceFlow, /allReferencesAnalyzed \? "awaiting_inspiration_review" : "ingesting"/);
@@ -158,6 +158,22 @@ test("extracts only two or three highlights per reference and waits for user sel
   assert.match(approveRoute, /"inspiration"/);
   assert.match(studio, /人工勾选创意高光/);
   assert.match(studio, /前往勾选创意高光/);
+});
+
+test("analyzes up to ten reference videos in parallel", async () => {
+  const [pipeline, studio] = await Promise.all([
+    readFile(new URL("../lib/pipeline.ts", import.meta.url), "utf8"),
+    readFile(new URL("../app/studio.tsx", import.meta.url), "utf8"),
+  ]);
+  assert.match(pipeline, /REFERENCE_ANALYSIS_BATCH_SIZE = 10/);
+  assert.match(pipeline, /slice\(batchStart, batchEnd\)\.map\(async/);
+  assert.match(pipeline, /await Promise\.all\(input\.references\.slice/);
+  assert.match(pipeline, /await Promise\.all\(batch\.files\.map/);
+  assert.match(pipeline, /mergeReferenceAnalyses/);
+  assert.match(pipeline, /referenceBatch: \{ startIndex: batchStart, endIndex: batchEnd, files \}/);
+  assert.match(pipeline, /completeReferenceBatch\(input, state, analyses, batch\.endIndex\)/);
+  assert.match(studio, /最多并行解析 10 条参考/);
+  assert.match(studio, /整批完成后自动进入下一批/);
 });
 
 test("revises one asset from user feedback and regenerates rejected storyboards", async () => {
@@ -524,6 +540,29 @@ test("lets the user edit every four-act anchor before video generation", async (
   assert.match(pipeline, /imagePlan,/);
   assert.match(projectInstructions, /local-only/);
   assert.match(projectInstructions, /localhost:3001/);
+});
+
+test("regenerates one four-act anchor from user feedback without replacing the other acts", async () => {
+  const [reviewUi, pipeline, regenerateRoute, styles] = await Promise.all([
+    readFile(new URL("../app/review-workflow.tsx", import.meta.url), "utf8"),
+    readFile(new URL("../lib/pipeline.ts", import.meta.url), "utf8"),
+    readFile(new URL("../app/api/projects/[id]/regenerate-storyboard-frame/route.ts", import.meta.url), "utf8"),
+    readFile(new URL("../app/globals.css", import.meta.url), "utf8"),
+  ]);
+  assert.match(reviewUi, /给 AI 的本幕修改意见/);
+  assert.match(reviewUi, /根据修改意见重新生成本幕/);
+  assert.match(reviewUi, /其他三幕、资产和顺序保持不变/);
+  assert.match(reviewUi, /regenerate-storyboard-frame/);
+  assert.match(reviewUi, /draftImagePlan: imagePlan/);
+  assert.match(reviewUi, /draftCanvas: canvas/);
+  assert.match(pipeline, /STORYBOARD_FRAME_REVISION_TOOL_NAME = "submit_revised_storyboard_frame"/);
+  assert.match(pipeline, /export async function regenerateStoryboardFrameWithFeedback/);
+  assert.match(pipeline, /image\.frameId === args\.frameId \? replacement : image/);
+  assert.match(pipeline, /await generateStoryboardFrameImage/);
+  assert.match(regenerateRoute, /state\.phase !== "awaiting_canvas_review"/);
+  assert.match(regenerateRoute, /state\.revision !== body\.revision/);
+  assert.match(regenerateRoute, /eq\(projects\.pipelineJson, currentPipelineJson\)/);
+  assert.match(styles, /\.frame-ai-regeneration/);
 });
 
 test("analyzes every required subject and scene before showing asset cards", async () => {

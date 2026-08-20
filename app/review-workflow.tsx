@@ -218,6 +218,8 @@ export function ReviewWorkflow({ view, projectId }: { view: ReviewView; projectI
   const [regeneratingAssetId, setRegeneratingAssetId] = useState<string | null>(null);
   const [overviewFeedback, setOverviewFeedback] = useState("");
   const [regeneratingOverview, setRegeneratingOverview] = useState(false);
+  const [frameFeedback, setFrameFeedback] = useState<Record<string, string>>({});
+  const [regeneratingFrameId, setRegeneratingFrameId] = useState<string | null>(null);
   const initializedRevision = useRef<number | null>(null);
   const pollInFlight = useRef(false);
 
@@ -603,6 +605,45 @@ export function ReviewWorkflow({ view, projectId }: { view: ReviewView; projectI
     finally { setSubmitting(false); }
   }
 
+  async function regenerateStoryboardFrame(index: number) {
+    const frame = imagePlan?.frames[index];
+    const feedback = frame ? (frameFeedback[frame.id] ?? "").trim() : "";
+    if (!project || project.reviewRevision == null || !imagePlan || !canvas || !frame) return;
+    if (feedback.length < 2) {
+      setMessage("请先填写至少2个字的本幕修改意见");
+      return;
+    }
+    setRegeneratingFrameId(frame.id);
+    setMessage("");
+    try {
+      const response = await fetch(`/api/projects/${project.id}/regenerate-storyboard-frame`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          frameId: frame.id,
+          feedback,
+          revision: project.reviewRevision,
+          draftImagePlan: imagePlan,
+          draftCanvas: canvas,
+        }),
+      });
+      const data = await response.json().catch(() => null) as { project?: Project; error?: string } | null;
+      if (!response.ok || !data?.project) throw new Error(data?.error ?? `第${index + 1}幕重新生成失败`);
+      setLoadedFrameIds((items) => { const next = new Set(items); next.delete(frame.id); return next; });
+      setFailedFrameIds((items) => { const next = new Set(items); next.delete(frame.id); return next; });
+      initializedRevision.current = null;
+      setProject(data.project);
+      hydrateEditors(data.project);
+      setFrameFeedback((items) => ({ ...items, [frame.id]: "" }));
+      setDirty(false);
+      setMessage(`第${index + 1}幕已按意见重写并重新生成，其他三幕保持不变。`);
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "本幕重新生成失败");
+    } finally {
+      setRegeneratingFrameId(null);
+    }
+  }
+
   if (!project) return <ReviewLoading label={view === "creative" ? "正在载入 Great Writer 创意故事" : view === "images" ? "正在载入分镜、总体提示词与资产" : "正在载入分镜画布"} error={message} onRetry={() => { setMessage(""); load().catch((error) => setMessage(error instanceof Error ? error.message : "任务读取失败")); }} />;
   const step = view === "creative" ? 1 : view === "images" ? 2 : 3;
   const planningCreativeCard = view === "images" && project.pipelinePhase === "planning_images";
@@ -829,13 +870,18 @@ export function ReviewWorkflow({ view, projectId }: { view: ReviewView; projectI
                 const generated = imageByFrame.get(canvasFrame.frameId);
                 return <div className="canvas-unit" key={canvasFrame.frameId}>
                   <article className="canvas-node">
-                    <div className="canvas-image" style={{ aspectRatio: previewAspectRatio, height: "auto" }}>{generated?.url ? <Image src={generated.url} alt={`画布视觉锚点 ${index + 1}`} fill sizes="(max-width: 820px) 70vw, 260px" unoptimized onLoad={() => setLoadedFrameIds((items) => new Set(items).add(canvasFrame.frameId))} onError={() => { setFailedFrameIds((items) => new Set(items).add(canvasFrame.frameId)); setMessage(`画布视觉锚点 ${index + 1} 图片加载失败，不能提交视频`); }} /> : <div className="missing-frame">图片未归档</div>}<span>ACT {String(index + 1).padStart(2, "0")}</span></div>
+                    <div className="canvas-image" style={{ aspectRatio: previewAspectRatio, height: "auto" }}>{generated?.url ? <Image key={`${canvasFrame.frameId}:${project.reviewRevision ?? 0}:${generated.url}`} src={generated.url} alt={`画布视觉锚点 ${index + 1}`} fill sizes="(max-width: 820px) 70vw, 260px" unoptimized onLoad={() => setLoadedFrameIds((items) => new Set(items).add(canvasFrame.frameId))} onError={() => { setFailedFrameIds((items) => new Set(items).add(canvasFrame.frameId)); setMessage(`画布视觉锚点 ${index + 1} 图片加载失败，不能提交视频`); }} /> : <div className="missing-frame">图片未归档</div>}<span>ACT {String(index + 1).padStart(2, "0")}</span></div>
                     <div className="canvas-node-copy"><strong>{frame?.title}</strong><small>{frame?.time_range} · {frame?.narrative_goal}</small></div>
                     <div className="frame-revision-editor">
                       <span>本幕可修改内容</span>
                       <label>画面描述与生成提示词<textarea rows={7} value={frame?.prompt ?? ""} placeholder={`填写第 ${index + 1} 幕的主体、场景、构图、光线与关键动作`} onChange={(event) => { const value = event.target.value; setDirty(true); setImagePlan((plan) => plan ? { ...plan, frames: plan.frames.map((entry) => entry.id === canvasFrame.frameId ? { ...entry, prompt: value } : entry) } : plan); }} /></label>
                       <label>动作与运镜<textarea rows={4} value={canvasFrame.motion} onChange={(event) => { setDirty(true); setCanvas((item) => item ? { ...item, frames: item.frames.map((entry, entryIndex) => entryIndex === index ? { ...entry, motion: event.target.value } : entry) } : item); }} /></label>
-                      <small>修改会保存到本幕并用于后续视频生成；当前锚点图不会自动重绘。</small>
+                      <div className="frame-ai-regeneration">
+                        <label>给 AI 的本幕修改意见<textarea rows={4} maxLength={1000} value={frameFeedback[canvasFrame.frameId] ?? ""} placeholder={`例如：第 ${index + 1} 幕改成雨夜；主体保持在画面左侧；增强动作结果，但不要改变人物服装和主光方向。`} onChange={(event) => setFrameFeedback((items) => ({ ...items, [canvasFrame.frameId]: event.target.value }))} /></label>
+                        <small>AI 会先按意见重写本幕提示词和运镜，再只重新生成这一张锚点图；其他三幕、资产和顺序保持不变。</small>
+                        <button type="button" disabled={regeneratingFrameId !== null || submitting || (frameFeedback[canvasFrame.frameId]?.trim().length ?? 0) < 2} aria-busy={regeneratingFrameId === canvasFrame.frameId} onClick={() => void regenerateStoryboardFrame(index)}>{regeneratingFrameId === canvasFrame.frameId ? `正在重写并重新生成第 ${index + 1} 幕…` : "根据修改意见重新生成本幕"}</button>
+                      </div>
+                      <small>也可以直接修改上方文字；确认画布后，最终编辑稿会用于后续视频生成。</small>
                     </div>
                   </article>
                   {index < canvas.transitions.length && <div className="canvas-edge"><div><i /><span>→</span><i /></div><label>转场 {index + 1}<textarea rows={3} value={canvas.transitions[index].description} onChange={(event) => setCanvas((item) => item ? { ...item, transitions: item.transitions.map((entry, entryIndex) => entryIndex === index ? { ...entry, description: event.target.value } : entry) } : item)} /></label></div>}
@@ -844,7 +890,7 @@ export function ReviewWorkflow({ view, projectId }: { view: ReviewView; projectI
             </div>
           </section>
           <section className="canvas-summary"><div><span>4</span><p>视觉锚点<br /><small>共同覆盖完整故事</small></p></div><div><span>{segmentCount}</span><p>AI 视频分段<br /><small>逐段生成后自动合成</small></p></div><div><span>{totalDuration}s</span><p>最终时长<br /><small>{videoRatio} · {outputDimensions} · {videoFps} fps</small></p></div><strong>{videoModelLabel} 将按已确认的完整故事时间轴规划 {segmentCount} 段视频；四幕锚点用于保持人物、物品与环境连续，不会被误当成四个固定视频片段。</strong></section>
-          <DecisionBar message={message} disabled={submitting || !allImagesAvailable} detail={allImagesAvailable ? `${videoModelLabel} · ${videoRatio} · ${videoResolution} · ${videoFps} fps · 共 ${totalDuration} 秒` : "四幕视觉锚点必须全部成功加载，才能提交视频"} label={submitting ? "正在锁定四幕画布" : `确认四幕画布，AI拆成${segmentCount}段并自动合成 →`} onClick={confirmCanvas} />
+          <DecisionBar message={message} disabled={submitting || regeneratingFrameId !== null || !allImagesAvailable} detail={regeneratingFrameId ? "正在按修改意见替换当前一幕，其他三幕保持不变" : allImagesAvailable ? `${videoModelLabel} · ${videoRatio} · ${videoResolution} · ${videoFps} fps · 共 ${totalDuration} 秒` : "四幕视觉锚点必须全部成功加载，才能提交视频"} label={submitting ? "正在锁定四幕画布" : `确认四幕画布，AI拆成${segmentCount}段并自动合成 →`} onClick={confirmCanvas} />
         </>
       )}
     </main>

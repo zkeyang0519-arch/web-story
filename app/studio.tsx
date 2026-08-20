@@ -262,7 +262,7 @@ function formatClock(seconds: number) {
 
 function statusCopy(status: string, phase?: string | null) {
   const copy: Record<string, { eyebrow: string; title: string; detail: string }> = {
-    ingesting: { eyebrow: "正在建立素材语境", title: "先提炼高光，再开始创作", detail: "每条参考提取2～3个有效创意点与高光点，过滤水印、片尾、重复展示和无效过渡。" },
+    ingesting: { eyebrow: "正在建立素材语境", title: "最多并行解析 10 条参考", detail: "同一批最多并行分析10条视频；每条提取2～3个有效创意点与高光点，整批完成后自动进入下一批。" },
     awaiting_inspiration_review: { eyebrow: "等待你选择灵感", title: "创意点与高光点已经列好", detail: "先勾选真正想采用的内容；确认后 Great Writer 才会开始融合全新创意。" },
     analyzing: { eyebrow: "已选灵感融合中", title: "只用你勾选的内容生成新创意", detail: "Great Writer 正在重组已选机制，未勾选内容不会进入故事。" },
     generating_assets: { eyebrow: "Visual Skills 分镜中", title: "正在把主故事拆成四幕分镜与可编辑资产", detail: "分镜提示词会同步写入总体提示词；资产确认后再生成连续关键帧。" },

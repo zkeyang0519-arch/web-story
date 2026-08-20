@@ -22,6 +22,7 @@ import {
 
 const ARK_BASE_URL = "https://ark.cn-beijing.volces.com/api/v3";
 const CINEMATIC_SCRIPT_MAX_LENGTH = 30000;
+const REFERENCE_ANALYSIS_BATCH_SIZE = 10;
 
 export type PipelineStatus =
   | "ingesting"
@@ -370,6 +371,11 @@ export type ArkPipelineState = {
   analyses: Array<Record<string, unknown>>;
   selectedHighlightIds?: string[];
   currentFileId?: string;
+  referenceBatch?: {
+    startIndex: number;
+    endIndex: number;
+    files: Array<{ index: number; fileId: string }>;
+  };
   creative?: CreativeCard;
   creativeAttempts?: CreativeAttempt[];
   creativeRecovery?: {
@@ -670,48 +676,73 @@ async function advanceArkPipeline(input: PipelineInput, state: ArkPipelineState,
           revision: (state.revision ?? 1) + 1,
           phase: "awaiting_inspiration_review",
           currentFileId: undefined,
+          referenceBatch: undefined,
         }, "inspiration_review", "每条参考视频已提炼2到3个创意点与高光点，等待你勾选后再融合创意", "success"),
       };
     }
-    const reference = input.references[state.referenceIndex];
-    if (reference.kind === "file" && typeof reference.uploadId === "string") {
-      const db = getDb();
-      const [upload] = await db.select().from(uploads).where(and(
-        eq(uploads.id, reference.uploadId),
-        eq(uploads.ownerId, ownerId),
-        eq(uploads.projectId, input.projectId),
-        eq(uploads.status, "ready"),
-      )).limit(1);
-      if (!upload) throw new Error(`参考视频 ${state.referenceIndex + 1} 已失效`);
-      const file = await uploadVideoToArk(upload);
-      return {
-        status: "ingesting",
-        progress: referenceProgress(state.referenceIndex, input.references.length),
-        state: withEvent({ ...state, phase: "waiting_file", currentFileId: file.id }, "preprocess", `参考 ${state.referenceIndex + 1} 已上传方舟，等待视频预处理`),
-      };
-    }
+    const batchStart = state.referenceIndex;
+    const batchEnd = Math.min(input.references.length, batchStart + REFERENCE_ANALYSIS_BATCH_SIZE);
+    const prepared: Array<{ index: number; fileId?: string; analysis?: Record<string, unknown> }> = await Promise.all(input.references.slice(batchStart, batchEnd).map(async (reference, offset) => {
+      const index = batchStart + offset;
+      if (reference.kind === "file" && typeof reference.uploadId === "string") {
+        const db = getDb();
+        const [upload] = await db.select().from(uploads).where(and(
+          eq(uploads.id, reference.uploadId),
+          eq(uploads.ownerId, ownerId),
+          eq(uploads.projectId, input.projectId),
+          eq(uploads.status, "ready"),
+        )).limit(1);
+        if (!upload) throw new Error(`参考视频 ${index + 1} 已失效`);
+        const file = await uploadVideoToArk(upload);
+        return { index, fileId: file.id };
+      }
 
-    const referenceUrl = typeof reference.resolvedUrl === "string" ? reference.resolvedUrl : reference.url;
-    if (reference.kind === "url" && typeof referenceUrl === "string" && (/^https?:\/\/.*\.(mp4|mov|webm)(\?|$)/i.test(referenceUrl) || reference.directVideo === true)) {
-      const analysis = await analyzeReference({ videoUrl: referenceUrl }, reference, state.referenceIndex);
-      return nextReferenceState(input, state, analysis);
-    }
-
-    throw new Error(`参考 ${state.referenceIndex + 1} 没有取得可解析的视频文件，请上传原视频后重试`);
+      const referenceUrl = typeof reference.resolvedUrl === "string" ? reference.resolvedUrl : reference.url;
+      if (reference.kind === "url" && typeof referenceUrl === "string" && (/^https?:\/\/.*\.(mp4|mov|webm)(\?|$)/i.test(referenceUrl) || reference.directVideo === true)) {
+        return { index, analysis: await analyzeReference({ videoUrl: referenceUrl }, reference, index) };
+      }
+      throw new Error(`参考 ${index + 1} 没有取得可解析的视频文件，请上传原视频后重试`);
+    }));
+    const directAnalyses = prepared.flatMap((item) => item.analysis ? [item.analysis] : []);
+    const files = prepared.flatMap((item) => item.fileId ? [{ index: item.index, fileId: item.fileId }] : []);
+    if (!files.length) return completeReferenceBatch(input, state, directAnalyses, batchEnd);
+    const label = referenceBatchLabel(batchStart, batchEnd);
+    return {
+      status: "ingesting",
+      progress: referenceProgress(batchStart, input.references.length),
+      state: withEvent({
+        ...state,
+        phase: "waiting_file",
+        analyses: mergeReferenceAnalyses(state.analyses, directAnalyses),
+        currentFileId: undefined,
+        referenceBatch: { startIndex: batchStart, endIndex: batchEnd, files },
+      }, "preprocess", `${label} 已按每批最多 ${REFERENCE_ANALYSIS_BATCH_SIZE} 条并行提交，等待视频预处理`),
+    };
   }
 
   if (state.phase === "waiting_file") {
-    if (!state.currentFileId) throw new Error("方舟文件标识缺失");
-    const file = await arkRequest<ArkFile>(`/files/${encodeURIComponent(state.currentFileId)}`);
-    if (file.status === "processing") {
-      return { status: "ingesting", progress: referenceProgress(state.referenceIndex, input.references.length), state: withEvent(state, "preprocess", `参考 ${state.referenceIndex + 1} 正在预处理画面与声音`) };
+    const batch = state.referenceBatch ?? (state.currentFileId ? {
+      startIndex: state.referenceIndex,
+      endIndex: Math.min(input.references.length, state.referenceIndex + 1),
+      files: [{ index: state.referenceIndex, fileId: state.currentFileId }],
+    } : null);
+    if (!batch?.files.length) throw new Error("方舟文件批次标识缺失");
+    const fileStatuses = await Promise.all(batch.files.map(async (item) => ({
+      ...item,
+      file: await arkRequest<ArkFile>(`/files/${encodeURIComponent(item.fileId)}`),
+    })));
+    const failedFile = fileStatuses.find((item) => item.file.status !== "processing" && item.file.status !== "active");
+    if (failedFile) throw new Error(failedFile.file.error?.message || `参考 ${failedFile.index + 1} 视频预处理失败（${failedFile.file.status || "unknown"}）`);
+    if (fileStatuses.some((item) => item.file.status === "processing")) {
+      const activeCount = fileStatuses.filter((item) => item.file.status === "active").length;
+      return {
+        status: "ingesting",
+        progress: referenceProgress(batch.startIndex, input.references.length),
+        state: withEvent({ ...state, referenceBatch: batch, currentFileId: undefined }, "preprocess", `${referenceBatchLabel(batch.startIndex, batch.endIndex)} 正在并行预处理画面与声音（${activeCount}/${batch.files.length} 已就绪）`),
+      };
     }
-    if (file.status !== "active") {
-      throw new Error(file.error?.message || `参考视频预处理失败（${file.status || "unknown"}）`);
-    }
-    const reference = input.references[state.referenceIndex];
-    const analysis = await analyzeReference({ fileId: state.currentFileId }, reference, state.referenceIndex);
-    return nextReferenceState(input, state, analysis);
+    const analyses = await Promise.all(batch.files.map((item) => analyzeReference({ fileId: item.fileId }, input.references[item.index], item.index)));
+    return completeReferenceBatch(input, state, analyses, batch.endIndex);
   }
 
   if (state.phase === "synthesizing") {
@@ -1234,11 +1265,12 @@ export function retryRecoverableStep(state: ArkPipelineState): PipelineSnapshot 
       storyboardImages: regenerateStoryboard ? undefined : state.storyboardImages,
       imageQuality: regenerateStoryboard ? state.imageQuality ?? legacyImageQuality : state.imageQuality,
       currentFileId: reprocessReference ? undefined : state.currentFileId,
+      referenceBatch: reprocessReference ? undefined : state.referenceBatch,
       taskId: regenerateCurrentSegment ? undefined : state.taskId,
       candidateVideoUrl: regenerateCurrentSegment ? undefined : state.candidateVideoUrl,
       stepRecovery: undefined,
     }, "step_retry", reprocessReference
-      ? "检测到视频令牌超限；仅重新上传并以受控抽帧率预处理当前参考，已完成的上游解析保持不变"
+      ? "检测到视频令牌超限；仅重新上传并以受控抽帧率预处理当前参考批次，已完成的上游解析保持不变"
       : regenerateStoryboard
       ? "按已保存的质检意见重新生成分镜图片，已确认的上游结果保持不变"
       : regenerateAssetImages
@@ -1247,23 +1279,39 @@ export function retryRecoverableStep(state: ArkPipelineState): PipelineSnapshot 
   };
 }
 
-function nextReferenceState(input: PipelineInput, state: ArkPipelineState, analysis: Record<string, unknown>): PipelineSnapshot {
-  const nextIndex = state.referenceIndex + 1;
+function mergeReferenceAnalyses(current: Array<Record<string, unknown>>, incoming: Array<Record<string, unknown>>) {
+  const bySourceIndex = new Map<number, Record<string, unknown>>();
+  for (const analysis of [...current, ...incoming]) bySourceIndex.set(Number(analysis.source_index ?? 0), analysis);
+  return [...bySourceIndex.values()].sort((a, b) => Number(a.source_index ?? 0) - Number(b.source_index ?? 0));
+}
+
+function referenceBatchLabel(startIndex: number, endIndex: number) {
+  return endIndex - startIndex <= 1 ? `参考 ${startIndex + 1}` : `参考 ${startIndex + 1}～${endIndex}`;
+}
+
+function completeReferenceBatch(
+  input: PipelineInput,
+  state: ArkPipelineState,
+  analyses: Array<Record<string, unknown>>,
+  nextIndex: number,
+): PipelineSnapshot {
   const allReferencesAnalyzed = nextIndex >= input.references.length;
+  const completedBatchLabel = referenceBatchLabel(state.referenceBatch?.startIndex ?? state.referenceIndex, nextIndex);
   const nextState: ArkPipelineState = {
     ...state,
     phase: allReferencesAnalyzed ? "awaiting_inspiration_review" : "ingesting",
     revision: allReferencesAnalyzed ? (state.revision ?? 1) + 1 : state.revision ?? 1,
     referenceIndex: nextIndex,
-    analyses: [...state.analyses, analysis],
+    analyses: mergeReferenceAnalyses(state.analyses, analyses),
     currentFileId: undefined,
+    referenceBatch: undefined,
   };
   return {
     status: allReferencesAnalyzed ? "awaiting_review" : "ingesting",
     progress: allReferencesAnalyzed ? 32 : referenceProgress(nextIndex, input.references.length),
     state: withEvent(nextState, allReferencesAnalyzed ? "inspiration_review" : "reference_analysis", allReferencesAnalyzed
       ? `全部${nextIndex}条参考已提炼创意点与高光点，请先勾选再生成新创意`
-      : `参考 ${nextIndex} 的创意点与高光点提炼完成`, "success"),
+      : `${completedBatchLabel} 已并行完成创意点与高光点提炼`, "success"),
   };
 }
 
@@ -1876,6 +1924,24 @@ const STORYBOARD_PLAN_TOOL = {
   },
 } as const;
 
+const STORYBOARD_FRAME_REVISION_TOOL_NAME = "submit_revised_storyboard_frame";
+const STORYBOARD_FRAME_REVISION_TOOL = {
+  type: "function",
+  name: STORYBOARD_FRAME_REVISION_TOOL_NAME,
+  description: "根据用户修改意见重写单独一幕的分镜文字，不改变幕序、时间范围或其他三幕",
+  parameters: {
+    type: "object",
+    additionalProperties: false,
+    required: ["title", "narrative_goal", "prompt", "motion"],
+    properties: {
+      title: { type: "string" },
+      narrative_goal: { type: "string" },
+      prompt: { type: "string" },
+      motion: { type: "string" },
+    },
+  },
+} as const;
+
 const VIDEO_SEGMENT_TOOL_NAME = "submit_video_segment_plan";
 const VIDEO_SEGMENT_TOOL = {
   type: "function",
@@ -2397,6 +2463,129 @@ async function planConfirmedStoryboardFrames(input: PipelineInput, creative: Cre
   () => buildEditableStoryboardFallback(input, imagePlan, response));
 }
 
+async function reviseStoryboardFrameCopy(
+  input: PipelineInput,
+  creative: CreativeCard,
+  imagePlan: ImagePlan,
+  currentFrame: StoryboardFrame,
+  currentMotion: string,
+  feedback: string,
+): Promise<Pick<StoryboardFrame, "title" | "narrative_goal" | "prompt" | "motion">> {
+  if (pipelineInfo().mode === "demo") {
+    return {
+      title: currentFrame.title,
+      narrative_goal: `${currentFrame.narrative_goal}；本轮调整重点：${feedback}`,
+      prompt: `${currentFrame.prompt}。用户本轮修改要求：${feedback}`,
+      motion: `${currentMotion}；镜头需与本轮修改后的画面状态自然衔接。`,
+    };
+  }
+
+  const otherFrames = imagePlan.frames.filter((frame) => frame.id !== currentFrame.id);
+  const model = arkConfig().reviewModel;
+  const startedAt = Date.now();
+  const prompt = `你是执行 Visual Skills / video 工作流的电影分镜导演。用户正在最终确认四幕画布，只修改指定的一幕。严格落实修改意见，重写这一幕的标题、叙事目标、静态关键帧提示词和动作运镜；不得改变该幕ID、幕序和时间范围，不得改写其他三幕，不得新增未确认资产。修改后必须继续满足全局故事因果、人物/产品身份、资产数量、空间轴线、运动方向、主光方向、视觉母题、上一幕尾帧与下一幕开场的连续性。prompt 写可直接生成单张锚点图的静态画面，motion 只写一个主要运镜及动作因果。
+用户简报：${JSON.stringify({ topic: input.topic, goal: input.goal, audience: input.audience, style: input.style, mustInclude: input.mustInclude, mustAvoid: input.mustAvoid })}
+已确认故事与总览：${JSON.stringify(imagePlan.overview)}
+全局连续性：${imagePlan.continuity_anchor}
+已确认资产：${JSON.stringify(imagePlan.asset_cards)}
+其他三幕（只用于保持衔接，不得改写）：${JSON.stringify(otherFrames)}
+当前幕：${JSON.stringify({ ...currentFrame, motion: currentMotion })}
+用户修改意见：${feedback}
+你必须调用 ${STORYBOARD_FRAME_REVISION_TOOL_NAME} 提交结构化结果，不得输出普通文本或 Markdown。`;
+  const response = await arkRequest<ArkResponse>("/responses", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      model,
+      input: prompt,
+      tools: [STORYBOARD_FRAME_REVISION_TOOL],
+      max_output_tokens: 2400,
+      thinking: { type: "disabled" },
+    }),
+  });
+  return organizeEditableResponse(response, {
+    stage: `第${currentFrame.order}幕修改`,
+    operation: "storyboard_frame_revision",
+    model,
+    startedAt,
+    toolName: STORYBOARD_FRAME_REVISION_TOOL_NAME,
+  }, (value) => ({
+    title: textValue(value.title, "分镜标题", 160),
+    narrative_goal: textValue(value.narrative_goal, "分镜叙事目标", 600),
+    prompt: textValue(value.prompt, "分镜图片提示词", 3600),
+    motion: textValue(value.motion, "分镜动作与运镜", 1000),
+  }), () => ({
+    title: currentFrame.title,
+    narrative_goal: `${currentFrame.narrative_goal}；本轮调整重点：${feedback}`,
+    prompt: `${currentFrame.prompt}。用户本轮修改要求：${feedback}`,
+    motion: `${currentMotion}；镜头需与本轮修改后的画面状态自然衔接。`,
+  }));
+}
+
+export async function regenerateStoryboardFrameWithFeedback(args: {
+  input: PipelineInput;
+  state: ArkPipelineState;
+  frameId: string;
+  feedback: string;
+  ownerId: string;
+  draftImagePlan?: unknown;
+  draftCanvas?: unknown;
+}): Promise<PipelineSnapshot> {
+  const feedback = args.feedback.trim();
+  if (args.state.phase !== "awaiting_canvas_review" || !args.state.imagePlan || !args.state.storyboardImages || args.state.storyboardImages.length !== 4) {
+    throw new Error("只有四幕画布确认前可以按意见重新生成本幕");
+  }
+  if (feedback.length < 2 || feedback.length > 1000) throw new Error("修改意见需要填写2到1000个字符");
+  const normalizedDraft = args.draftImagePlan
+    ? normalizeImagePlan(args.draftImagePlan, args.state.creative?.assets, false, args.input.duration)
+    : args.state.imagePlan;
+  const baseImagePlan: ImagePlan = { ...normalizedDraft, confirmation: args.state.imagePlan.confirmation };
+  const persistedFrameIds = args.state.imagePlan.frames.map((frame) => frame.id);
+  const draftFrameIds = baseImagePlan.frames.map((frame) => frame.id);
+  if (draftFrameIds.some((id, index) => id !== persistedFrameIds[index])) throw new Error("四幕编辑稿不能删除、增加或重排分镜");
+  const frameIndex = baseImagePlan.frames.findIndex((frame) => frame.id === args.frameId);
+  if (frameIndex < 0) throw new Error("要重新生成的分镜不存在");
+  if (!args.draftCanvas) throw new Error("请提交当前四幕画布编辑稿");
+  const baseCanvas = normalizeCanvasPlan(args.draftCanvas, baseImagePlan, args.state.storyboardImages);
+  const currentFrame = baseImagePlan.frames[frameIndex];
+  const currentMotion = baseCanvas.frames[frameIndex]?.motion ?? currentFrame.motion;
+  const revised = await reviseStoryboardFrameCopy(args.input, args.state.creative ?? {}, baseImagePlan, currentFrame, currentMotion, feedback);
+  const frames = baseImagePlan.frames.map((frame, index) => index === frameIndex ? { ...frame, ...revised } : frame);
+  const imagePlan = compileVisualSkillsOverallPrompt(args.input, { ...baseImagePlan, frames });
+  const canvas: CanvasPlan = {
+    ...baseCanvas,
+    frames: baseCanvas.frames.map((frame, index) => index === frameIndex ? { ...frame, motion: revised.motion } : frame),
+  };
+  const nextRevision = (args.state.revision ?? 1) + 1;
+  const replacement = pipelineInfo().mode === "demo"
+    ? {
+      frameId: currentFrame.id,
+      order: currentFrame.order,
+      sourceUrl: "/og-story-card.png",
+      objectKey: "",
+      size: seedreamSizeForRatio(args.input.ratio),
+      model: "Demo Storyboard Revision",
+      cost: 0,
+      generatedAt: new Date().toISOString(),
+    }
+    : await generateStoryboardFrameImage(args.input, args.state.creative ?? {}, imagePlan, frames[frameIndex], args.ownerId, nextRevision, feedback);
+  const storyboardImages = args.state.storyboardImages
+    .map((image) => image.frameId === args.frameId ? replacement : image)
+    .sort((a, b) => a.order - b.order);
+  return {
+    status: "awaiting_review",
+    progress: 72,
+    state: withEvent({
+      ...args.state,
+      revision: nextRevision,
+      imagePlan,
+      canvas,
+      storyboardImages,
+      imageQuality: undefined,
+    }, "storyboard_frame_regenerated", `已根据修改意见重写并重新生成第${currentFrame.order}幕；其他三幕保持不变`, "success"),
+  };
+}
+
 async function planVideoSegments(
   input: PipelineInput,
   creative: CreativeCard,
@@ -2562,6 +2751,59 @@ ${frameLines}
     cost: 0.22,
     generatedAt: new Date().toISOString(),
   })));
+}
+
+async function generateStoryboardFrameImage(
+  input: PipelineInput,
+  creative: CreativeCard,
+  imagePlan: ImagePlan,
+  frame: StoryboardFrame,
+  ownerId: string,
+  revision: number,
+  feedback: string,
+): Promise<StoryboardImage> {
+  const assetLines = imagePlan.asset_cards.map((asset) => `${asset.category}/${asset.name}：${asset.prompt}；连续性：${asset.continuity_notes}`).join("\n");
+  const otherFrameLines = imagePlan.frames.filter((item) => item.id !== frame.id).map((item) => `第${item.order}幕（衔接参考）：${item.title}；${item.prompt}`).join("\n");
+  const brandVisualRequired = Boolean(input.company?.trim()) || /品牌|包装|logo|标识|文字/i.test(input.mustInclude ?? "");
+  const textPolicy = brandVisualRequired
+    ? `如画面包含已授权品牌“${input.company || "用户指定品牌"}”或产品包装，只能准确保持用户要求的外观与标识，不得杜撰其他品牌或文字`
+    : "禁止任何文字、字幕、logo和水印";
+  const prompt = `只生成一张${input.ratio}高质量短视频分镜锚点图，不要输出组图、拼贴、分屏或其他三幕。这是完整${input.duration}秒故事的第${frame.order}幕（${frame.time_range}），必须严格执行用户本轮修改意见，同时保持与其他三幕相同的主体身份、产品外观、服装、场景布局、美术风格、色彩、空间轴线和主光方向。
+用户本轮修改意见：${feedback}
+本幕标题与叙事目标：${frame.title}；${frame.narrative_goal}
+本幕最终图片提示词：${frame.prompt}
+本幕动作与运镜参考：${frame.motion}
+连续性圣经：${imagePlan.continuity_anchor}
+故事与视觉方向：${imagePlan.overview.story}；${imagePlan.overview.visual_direction}
+创意主句：${creative.concept || creative.theme || input.topic || input.goal}
+已确认资产卡：
+${assetLines}
+其他三幕只用于保持前后衔接：
+${otherFrameLines}
+全局规则：${textPolicy}；禁止边框、分屏、拼贴；禁止出现“${input.mustAvoid || "畸形手部、重复肢体、模糊主体"}”。画面只有一个0.3秒内可读的视觉焦点，并为本幕主要运镜预留空间。`;
+  const response = await arkRequest<ArkImageResponse>("/images/generations", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      model: arkConfig().imageModel,
+      prompt,
+      size: seedreamSizeForRatio(input.ratio),
+      response_format: "url",
+      watermark: false,
+    }),
+  });
+  const output = (response.data ?? []).find((item): item is { url: string; size?: string } => Boolean(item.url));
+  if (!output) throw new Error(`第${frame.order}幕没有返回可用图片`);
+  return {
+    frameId: frame.id,
+    order: frame.order,
+    sourceUrl: output.url,
+    objectKey: await archiveImage(input.projectId, ownerId, output.url, revision, frame.order),
+    size: output.size,
+    model: response.model ?? arkConfig().imageModel,
+    cost: 0.22,
+    generatedAt: new Date().toISOString(),
+  };
 }
 
 async function reviewStoryboardImages(input: PipelineInput, creative: CreativeCard, imagePlan: ImagePlan, images: StoryboardImage[]) {
@@ -3733,23 +3975,26 @@ function advanceDemoPipeline(input: PipelineInput, state: ArkPipelineState): Pip
     if (state.referenceIndex >= input.references.length) {
       return { status: "awaiting_review", progress: 32, state: withEvent({ ...state, revision: (state.revision ?? 1) + 1, phase: "awaiting_inspiration_review" }, "inspiration_review", "示例参考已提炼创意点与高光点，等待勾选", "success") };
     }
-    const reference = input.references[state.referenceIndex];
-    const analysis = {
-      source_index: state.referenceIndex + 1,
-      source_name: String(reference.name ?? `参考 ${state.referenceIndex + 1}`),
-      summary: "示例素材以生活化动作、快速建立情境和清晰产品特写构成短视频节奏。",
-      duration_sec: 8,
-      creative_highlights: [
-        { id: `ref_${state.referenceIndex + 1}_idea_1`, type: "创意点", title: "反常动作直接建立问题", evidence: "主体正在快速完成日常任务时，一个意外动作突然打断原有节奏。", why_effective: "动作立即改变画面状态并制造未完成期待。", transferable_core: "保留“意外动作打断惯性”的机制，重写人物、目标和触发物。" },
-        { id: `ref_${state.referenceIndex + 1}_idea_2`, type: "高光点", title: "物件反馈替代解释", evidence: "关键物件产生可见反馈，主体的手部和呼吸随之改变。", why_effective: "观众通过物理结果直接理解转折，无需旁白说明。", transferable_core: "保留“物理反馈证明变化”的结构，替换物件、品牌和具体结果。" },
-        { id: `ref_${state.referenceIndex + 1}_idea_3`, type: "高光点", title: "声音停顿完成情绪释放", evidence: "急促动作声突然停止，短暂安静后画面停在清晰结果上。", why_effective: "节奏反差放大结果，并给结尾留下记忆空间。", transferable_core: "保留“声音骤停—结果显现”的节奏机制，为新故事设计全新声音母题。" },
-      ],
-      usable_material_descriptions: [],
-      creative_opportunities: [],
-      quality_risks: ["避免照搬参考台词和品牌"],
-      confidence: 0.86,
-    };
-    return nextReferenceState(input, state, analysis);
+    const batchEnd = Math.min(input.references.length, state.referenceIndex + REFERENCE_ANALYSIS_BATCH_SIZE);
+    const analyses = input.references.slice(state.referenceIndex, batchEnd).map((reference, offset) => {
+      const index = state.referenceIndex + offset;
+      return {
+        source_index: index + 1,
+        source_name: String(reference.name ?? `参考 ${index + 1}`),
+        summary: "示例素材以生活化动作、快速建立情境和清晰产品特写构成短视频节奏。",
+        duration_sec: 8,
+        creative_highlights: [
+          { id: `ref_${index + 1}_idea_1`, type: "创意点", title: "反常动作直接建立问题", evidence: "主体正在快速完成日常任务时，一个意外动作突然打断原有节奏。", why_effective: "动作立即改变画面状态并制造未完成期待。", transferable_core: "保留“意外动作打断惯性”的机制，重写人物、目标和触发物。" },
+          { id: `ref_${index + 1}_idea_2`, type: "高光点", title: "物件反馈替代解释", evidence: "关键物件产生可见反馈，主体的手部和呼吸随之改变。", why_effective: "观众通过物理结果直接理解转折，无需旁白说明。", transferable_core: "保留“物理反馈证明变化”的结构，替换物件、品牌和具体结果。" },
+          { id: `ref_${index + 1}_idea_3`, type: "高光点", title: "声音停顿完成情绪释放", evidence: "急促动作声突然停止，短暂安静后画面停在清晰结果上。", why_effective: "节奏反差放大结果，并给结尾留下记忆空间。", transferable_core: "保留“声音骤停—结果显现”的节奏机制，为新故事设计全新声音母题。" },
+        ],
+        usable_material_descriptions: [],
+        creative_opportunities: [],
+        quality_risks: ["避免照搬参考台词和品牌"],
+        confidence: 0.86,
+      };
+    });
+    return completeReferenceBatch(input, state, analyses, batchEnd);
   }
   if (state.phase === "synthesizing") {
     const creative: CreativeCard = {
