@@ -8,6 +8,7 @@ export const dynamic = "force-dynamic";
 type Bindings = { MEDIA?: R2Bucket };
 
 const PART_SIZE = 5 * 1024 * 1024;
+const MAX_MULTIMODAL_VIDEO_BYTES = 50 * 1024 * 1024;
 const acceptedTypes = new Set(["video/mp4", "video/quicktime", "video/webm"]);
 
 function safeFilename(value: string) {
@@ -34,6 +35,9 @@ export async function POST(request: Request) {
     const byteSize = body.byteSize;
     if (typeof byteSize !== "number" || !Number.isSafeInteger(byteSize) || byteSize <= 0) {
       return Response.json({ error: "视频文件为空或大小无效" }, { status: 400 });
+    }
+    if (byteSize > MAX_MULTIMODAL_VIDEO_BYTES) {
+      return Response.json({ error: "单条参考视频不能超过 50MB（多模态分析输入上限）" }, { status: 413 });
     }
 
     const owner = request.headers.get("oai-authenticated-user-id") ?? "local-preview";

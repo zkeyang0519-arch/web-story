@@ -1,9 +1,37 @@
 import { projects } from "@/db/schema";
 import type { ArkPipelineState } from "@/lib/pipeline";
+import {
+  buildFrameBasedFourActFallback,
+  compileVisualSkillsPrompt,
+  fourActTimeRanges,
+} from "@/lib/visual-skills-prompt";
 
 type LegacyPipeline = ArkPipelineState & {
   keyframe?: { objectKey?: string; model?: string; size?: string };
 };
+
+function visibleCinematicScript(input: Record<string, unknown>, imagePlan: NonNullable<ArkPipelineState["imagePlan"]>) {
+  const duration = Number(input.duration ?? 15);
+  const ratio = String(input.ratio ?? "9:16");
+  const resolution = String(input.resolution ?? "1080p");
+  const fps = Number(input.fps ?? 24);
+  const fallbackScript = buildFrameBasedFourActFallback({
+    duration,
+    ratio,
+    resolution,
+    fps,
+    visualDirection: imagePlan.overview.visual_direction,
+    assetRelationships: imagePlan.overview.asset_relationships,
+    continuityAnchor: imagePlan.continuity_anchor,
+    frames: imagePlan.frames,
+  });
+  return compileVisualSkillsPrompt({
+    script: imagePlan.overview.cinematic_script || fallbackScript,
+    fallbackScript,
+    frames: imagePlan.frames,
+    header: `目标模型：${String(input.videoModel ?? "Seedance")}；总时长${duration}秒；${ratio}；${resolution}；${fps}fps。四幕与分镜字段逐项同步，后续视频分段不得改变故事因果、资产身份、空间方向、主光方向和最终画面。`,
+  });
+}
 
 export function presentProject(row: typeof projects.$inferSelect) {
   const pipeline = row.pipelineJson ? JSON.parse(row.pipelineJson) as LegacyPipeline : null;
@@ -35,11 +63,18 @@ export function presentProject(row: typeof projects.$inferSelect) {
     model: image.model ?? null,
     size: image.size ?? null,
   }));
-  const visibleImagePlan = pipeline?.imagePlan ? {
+  const displayImagePlan = pipeline?.imagePlan ? {
     ...pipeline.imagePlan,
+    frames: pipeline.imagePlan.frames.map((frame, index) => ({
+      ...frame,
+      time_range: fourActTimeRanges(Number(input.duration ?? 15))[index],
+    })),
+  } : null;
+  const visibleImagePlan = displayImagePlan ? {
+    ...displayImagePlan,
     overview: {
-      ...pipeline.imagePlan.overview,
-      cinematic_script: pipeline.imagePlan.overview.cinematic_script || `【全局视觉圣经】${Number(input.duration ?? 15)}秒，${String(input.ratio ?? "9:16")}，${String(input.resolution ?? "1080p")}，${Number(input.fps ?? 24)}fps。整体视觉：${pipeline.imagePlan.overview.visual_direction}。固定资产关系：${pipeline.imagePlan.overview.asset_relationships}。全局连续性：${pipeline.imagePlan.continuity_anchor}。\n\n【第一幕｜钩子建立】建立主体、目标、空间坐标与前2秒变化；明确景别、焦段、机位、运动、焦点、动作时间轴、物理反馈、光色与片尾状态。\n\n【第二幕｜行动发展】保持轴线、资产位置、人物外观与光源方向，推进一个新行动及其环境和声音反馈。\n\n【第三幕｜因果转折】只呈现一次明确的冲突变化与结果，摄影机反馈短促克制，尾帧为下一幕承接。\n\n【第四幕｜结果收束】完成可见结果、情绪余韵和自然行动号召；稳定停在资产关系清晰的结尾画面。\n\n禁止变脸、额外肢体、资产复制/漂移、方向跳变、动作重复、突然切镜、过曝、乱码、文字和水印。`,
+      ...displayImagePlan.overview,
+      cinematic_script: visibleCinematicScript(input, displayImagePlan),
     },
   } : null;
   return {
@@ -59,6 +94,7 @@ export function presentProject(row: typeof projects.$inferSelect) {
     storyboardImages,
     review: pipeline ? {
       analyses: pipeline.analyses ?? [],
+      selectedHighlightIds: pipeline.selectedHighlightIds ?? [],
       creative: pipeline.creative ?? null,
       imagePlan: visibleImagePlan,
       canvas: pipeline.canvas ?? null,

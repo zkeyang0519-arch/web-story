@@ -18,11 +18,11 @@ export async function POST(request: Request, context: { params: Promise<{ id: st
     }
     const { id } = await context.params;
     const body = await request.json() as {
-      gate?: "creative" | "image_plan" | "asset_images" | "canvas";
+      gate?: "inspiration" | "creative" | "image_plan" | "asset_images" | "canvas";
       revision?: number;
       payload?: unknown;
     };
-    if (!body.gate || !["creative", "image_plan", "asset_images", "canvas"].includes(body.gate) || typeof body.revision !== "number" || body.payload == null) {
+    if (!body.gate || !["inspiration", "creative", "image_plan", "asset_images", "canvas"].includes(body.gate) || typeof body.revision !== "number" || body.payload == null) {
       return Response.json({ error: "缺少确认阶段、版本或确认内容" }, { status: 400 });
     }
 

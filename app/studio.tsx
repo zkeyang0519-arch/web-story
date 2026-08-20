@@ -90,6 +90,7 @@ type Project = {
   runMode: "demo" | "production";
   pipelinePhase?: string | null;
   reviewRevision?: number | null;
+  review?: { selectedHighlightIds?: string[] } | null;
   keyframeUrl?: string | null;
   keyframeModel?: string | null;
   keyframeSize?: string | null;
@@ -156,14 +157,17 @@ type SystemInfo = {
   missing?: string[];
 };
 
+const MAX_MULTIMODAL_VIDEO_BYTES = 50 * 1024 * 1024;
+
 type StudioView = "references" | "brief" | "spec" | "quote" | "progress" | "result";
 
 const processSteps = [
   { key: "receive", label: "接收并校验参考素材", detail: "确认文件、链接与素材权限", end: 6 },
   { key: "preprocess", label: "方舟文件预处理", detail: "上传并准备画面与声音轨道", end: 18 },
-  { key: "understand", label: "逐条视频内容解析", detail: "提取高光、节奏与创意机制", end: 30 },
-  { key: "creative", label: "Great Writer 故事与人工确认", detail: "参考解析后先生成一篇可修改的原创故事", end: 40 },
-  { key: "image_plan", label: "AI 视频详细脚本与资产确认", detail: "确认故事改编脚本、必要资产与连续性", end: 50 },
+  { key: "understand", label: "逐条视频创意提炼", detail: "每条只保留2～3个有效创意点与高光点", end: 30 },
+  { key: "select", label: "人工勾选创意高光", detail: "未勾选内容不会进入创意融合", end: 34 },
+  { key: "creative", label: "Great Writer 融合新创意", detail: "仅依据勾选内容生成一篇可修改的原创故事", end: 40 },
+  { key: "image_plan", label: "Visual Skills 分镜与资产确认", detail: "确认四幕分镜、总体提示词、必要资产与连续性", end: 50 },
   { key: "storyboard", label: "Seedream 连贯分镜生成", detail: "按选定画幅生成并归档4张关键画面", end: 72 },
   { key: "canvas", label: "画布连接与人工确认", detail: "锁定顺序、动作与3个转场", end: 74 },
   { key: "segment", label: "AI 规划视频片段", detail: "按总时长拆成若干个4～15秒片段", end: 76 },
@@ -258,9 +262,10 @@ function formatClock(seconds: number) {
 
 function statusCopy(status: string, phase?: string | null) {
   const copy: Record<string, { eyebrow: string; title: string; detail: string }> = {
-    ingesting: { eyebrow: "正在建立素材语境", title: "先看懂参考，再开始创作", detail: "提取节奏、画面语言与创意钩子，过滤水印、片尾和无效片段。" },
-    analyzing: { eyebrow: "创意中枢工作中", title: "比较创意，并收敛成一个方向", detail: "Seed 视觉解析与高质量复核模型会提取、比较并融合创意，只把最终结论交给生成环节。" },
-    generating_assets: { eyebrow: "创意资产准备中", title: "正在把主故事拆成可编辑资产", detail: "先创建人物、动物、物品、产品与环境创意卡，确认后再生成连续分镜。" },
+    ingesting: { eyebrow: "正在建立素材语境", title: "先提炼高光，再开始创作", detail: "每条参考提取2～3个有效创意点与高光点，过滤水印、片尾、重复展示和无效过渡。" },
+    awaiting_inspiration_review: { eyebrow: "等待你选择灵感", title: "创意点与高光点已经列好", detail: "先勾选真正想采用的内容；确认后 Great Writer 才会开始融合全新创意。" },
+    analyzing: { eyebrow: "已选灵感融合中", title: "只用你勾选的内容生成新创意", detail: "Great Writer 正在重组已选机制，未勾选内容不会进入故事。" },
+    generating_assets: { eyebrow: "Visual Skills 分镜中", title: "正在把主故事拆成四幕分镜与可编辑资产", detail: "分镜提示词会同步写入总体提示词；资产确认后再生成连续关键帧。" },
     generating_asset_images: { eyebrow: "Seedream 资产图生成中", title: "正在逐项生成真实资产图", detail: "每张图严格对应一个已确认资产 ID；完成后会用原卡片排版替换占位图供你复核。" },
     awaiting_asset_image_review: { eyebrow: "等待资产图确认", title: "真实资产图已经回填", detail: "请在原资产卡位置检查人物、产品、物品与环境；确认后才规划四幕分镜。" },
     generating_video: { eyebrow: "Seedance 2.0 生成中", title: "镜头正在逐条进入监看台", detail: "高风险镜头会生成备选版本，系统自动保留质量更高的一条。" },
@@ -281,7 +286,7 @@ function statusCopy(status: string, phase?: string | null) {
 }
 
 function reviewRoute(project: Project) {
-  if (project.pipelinePhase === "awaiting_creative_review") return `/projects/${project.id}/creative-review`;
+  if (["awaiting_inspiration_review", "awaiting_creative_review"].includes(project.pipelinePhase ?? "")) return `/projects/${project.id}/creative-review`;
   if (["planning_images", "awaiting_image_plan", "generating_asset_images", "awaiting_asset_image_review", "planning_storyboard", "generating_images", "reviewing_images"].includes(project.pipelinePhase ?? "")) return `/projects/${project.id}/creative-card`;
   if (project.pipelinePhase === "awaiting_canvas_review") return `/projects/${project.id}/canvas`;
   if (["planning_video_segments", "submitting_video", "polling_video", "reviewing_video", "assembling_video"].includes(project.pipelinePhase ?? "")) return `/projects/${project.id}/progress`;
@@ -435,10 +440,10 @@ export function Studio({ view = "references", projectId }: { view?: StudioView; 
     const current = references.length;
     const accepted = Array.from(files).filter((file) => {
       const validType = file.type.startsWith("video/") || /\.(mp4|mov|webm)$/i.test(file.name);
-      return validType && file.size > 0;
+      return validType && file.size > 0 && file.size <= MAX_MULTIMODAL_VIDEO_BYTES;
     });
     if (accepted.length !== Array.from(files).length) {
-      setMessage("部分文件未添加：仅支持有效的 MP4、MOV 或 WebM 视频。 ");
+      setMessage("部分文件未添加：仅支持有效的 MP4、MOV 或 WebM，且单条不能超过 50MB。 ");
     }
     const next = accepted.slice(0, Math.max(0, 10 - current)).map((file) => ({
       id: uid(), kind: "file" as const, name: file.name, file, size: file.size, priority: false, emphasis: ["节奏", "画面"], status: "pending" as const, progress: 0, statusText: "等待上传",
@@ -680,6 +685,8 @@ export function Studio({ view = "references", projectId }: { view?: StudioView; 
       const data = await response.json().catch(() => null) as { project?: Project; error?: string } | null;
       if (!response.ok || !data?.project) throw new Error(data?.error ?? "无法重新启动 Great Writer 故事生成");
       setProject(data.project);
+      const destination = reviewRoute(data.project);
+      if (destination) router.push(destination);
     } catch (error) {
       setMessage(error instanceof Error ? error.message : "Great Writer 故事重试失败");
     } finally {
@@ -791,11 +798,16 @@ export function Studio({ view = "references", projectId }: { view?: StudioView; 
   const priorityCount = references.filter((item) => item.priority).length;
   const referencesReady = references.length > 0 && references.every((item) => item.status === "ready");
   const referencesProcessing = references.some((item) => item.status === "pending" || item.status === "processing");
+  const needsHighlightSelectionRecovery = Boolean(project
+    && project.status === "failed"
+    && project.pipelinePhase === "synthesizing"
+    && !(project.review?.selectedHighlightIds?.length)
+    && project.error?.message?.includes("没有已勾选"));
   const needsCreativeRecovery = Boolean(project && (
     (project.status === "needs_action" && project.pipelinePhase === "creative_recovery")
     || (project.status === "failed" && project.pipelinePhase === "synthesizing" && project.error?.code === "ArkPipelineError")
   ));
-  const recoverableStepPhases = ["waiting_file", "planning_images", "generating_asset_images", "planning_storyboard", "generating_images", "reviewing_images", "planning_video_segments", "submitting_video", "polling_video", "reviewing_video", "assembling_video"];
+  const recoverableStepPhases = ["ingesting", "waiting_file", "planning_images", "generating_asset_images", "planning_storyboard", "generating_images", "reviewing_images", "planning_video_segments", "submitting_video", "polling_video", "reviewing_video", "assembling_video"];
   const needsStepRecovery = Boolean(project && (
     (project.status === "needs_action" && (project.stepRecovery?.retryable || recoverableStepPhases.includes(project.pipelinePhase ?? "")))
     || (project.status === "failed" && recoverableStepPhases.includes(project.pipelinePhase ?? ""))
@@ -809,7 +821,11 @@ export function Studio({ view = "references", projectId }: { view?: StudioView; 
   ));
   const isStopped = Boolean(project && ["failed", "cancelled"].includes(project.status) && !needsCreativeRecovery && !needsStepRecovery);
   const isPaused = isStopped || needsCreativeRecovery || needsStepRecovery;
-  const currentProcessIndex = project?.status === "completed" ? processSteps.length : Math.max(0, processSteps.findIndex((step) => (project?.progress ?? 0) < step.end));
+  const currentProcessIndex = project?.status === "completed"
+    ? processSteps.length
+    : needsHighlightSelectionRecovery
+      ? Math.max(0, processSteps.findIndex((step) => step.key === "select"))
+      : Math.max(0, processSteps.findIndex((step) => (project?.progress ?? 0) < step.end));
   const processDoneCount = project?.status === "completed" ? processSteps.length : currentProcessIndex;
   const currentCopy = project ? statusCopy(project.status, project.pipelinePhase) : statusCopy("ingesting");
   const selectedProfile = getVideoModelProfile(videoModel);
@@ -881,14 +897,14 @@ export function Studio({ view = "references", projectId }: { view?: StudioView; 
           <div>
             <button className="text-button" onClick={() => router.push("/")}>← 返回制片单</button>
             <p className="eyebrow">任务 {project.id.slice(0, 8).toUpperCase()}</p>
-            <h1>{needsCreativeRecovery ? "Great Writer 故事需要重新处理" : needsStepRecovery ? `${project.stepRecovery?.stage ?? "当前步骤"}需要重新处理` : isStopped ? project.status === "cancelled" ? "任务已结束" : "制作已停止" : "正在制作视频"}</h1>
-            <p>{needsCreativeRecovery ? `${project.input.references.length}条参考视频解析已经保留；重试不会重新上传或重新解析素材。` : needsStepRecovery ? "已完成的上游素材和确认结果全部保留；重试只执行当前失败步骤。" : isStopped ? "系统已停止后续步骤，请查看错误并重新输入。" : "任务会在后台继续运行，你可以安全离开此页面。"}</p>
+            <h1>{needsHighlightSelectionRecovery ? "创意高光正在等待你勾选" : needsCreativeRecovery ? "Great Writer 故事需要重新处理" : needsStepRecovery ? `${project.stepRecovery?.stage ?? "当前步骤"}需要重新处理` : isStopped ? project.status === "cancelled" ? "任务已结束" : "制作已停止" : "正在制作视频"}</h1>
+            <p>{needsHighlightSelectionRecovery ? `${project.input.references.length}条参考的候选高光已经保留；进入选择页勾选后才会生成新创意。` : needsCreativeRecovery ? `${project.input.references.length}条参考视频解析已经保留；重试不会重新上传或重新解析素材。` : needsStepRecovery ? "已完成的上游素材和确认结果全部保留；重试只执行当前失败步骤。" : isStopped ? "系统已停止后续步骤，请查看错误并重新输入。" : "任务会在后台继续运行，你可以安全离开此页面。"}</p>
           </div>
           <div className={`run-chip ${isPaused ? "stopped" : ""}`}><span className="live-dot" /> {needsCreativeRecovery || needsStepRecovery ? "等待重试" : isStopped ? "任务已停止" : project.runMode === "demo" ? "演示管线" : "生产管线"}</div>
         </section>
 
         {isStopped && <section className="run-error wrap" role="alert"><div><span>{project.status === "cancelled" ? "CANCELLED" : "FAILED"}</span><strong>{project.error?.message || (project.status === "cancelled" ? "任务已由用户结束" : "制作过程中发生错误")}</strong><p>不会继续执行任何后续模型任务。请重新检查素材、链接或创作要求后再提交。</p></div><button onClick={() => router.push("/")}>重新输入并创建新任务 →</button></section>}
-        {needsCreativeRecovery && <section className="run-error recovery-error wrap" role="alert"><div><span>STORY RECOVERY</span><strong>{project.error?.message || project.recovery?.message || "Great Writer 故事没有通过结构校验"}</strong><p>单条视频解析结果不会丢失；系统将只重试故事生成，最多执行“同模型修复 + 备用模型”三层兜底。</p>{message && <p className="recovery-message">{message}</p>}{project.recovery?.attempts?.length ? <details className="recovery-attempts"><summary>查看模型与字段错误</summary>{project.recovery.attempts.map((attempt, index) => <div key={`${attempt.createdAt}-${index}`}><b>{attempt.model}</b><span>{attempt.strategy} · {attempt.status}</span>{attempt.errors.slice(0, 5).map((error) => <code key={error}>{error}</code>)}</div>)}</details> : null}</div><button disabled={submitting} onClick={() => void retryCreativeOnly()}>{submitting ? "正在恢复故事…" : "仅重试 Great Writer 故事 →"}</button></section>}
+        {needsCreativeRecovery && <section className="run-error recovery-error wrap" role="alert"><div><span>{needsHighlightSelectionRecovery ? "HIGHLIGHT SELECTION" : "STORY RECOVERY"}</span><strong>{needsHighlightSelectionRecovery ? "候选创意点与高光点已经提取完成，但还没有勾选" : project.error?.message || project.recovery?.message || "Great Writer 故事没有通过结构校验"}</strong><p>{needsHighlightSelectionRecovery ? "点击右侧按钮进入专用选择页。每条参考会展示2～3个候选，可跨视频多选；未选内容不会进入创意融合。" : "单条视频解析结果不会丢失；系统将只重试故事生成，最多执行“同模型修复 + 备用模型”三层兜底。"}</p>{message && <p className="recovery-message">{message}</p>}{!needsHighlightSelectionRecovery && project.recovery?.attempts?.length ? <details className="recovery-attempts"><summary>查看模型与字段错误</summary>{project.recovery.attempts.map((attempt, index) => <div key={`${attempt.createdAt}-${index}`}><b>{attempt.model}</b><span>{attempt.strategy} · {attempt.status}</span>{attempt.errors.slice(0, 5).map((error) => <code key={error}>{error}</code>)}</div>)}</details> : null}</div><button disabled={submitting} onClick={() => void retryCreativeOnly()}>{submitting ? (needsHighlightSelectionRecovery ? "正在打开选择页…" : "正在恢复故事…") : (needsHighlightSelectionRecovery ? "前往勾选创意高光 →" : "仅重试 Great Writer 故事 →")}</button></section>}
         {needsStepRecovery && <section className="run-error recovery-error wrap" role="alert"><div><span>STEP RECOVERY</span><strong>{project.error?.message || project.stepRecovery?.message || "当前步骤没有返回可用结果"}</strong><p>{regeneratesStoryboard ? "质检意见已经保存。系统会保留已确认的故事、资产卡与四幕规划，重新生成四张分镜后自动再次质检。" : `失败阶段：${project.stepRecovery?.stage ?? project.pipelinePhase}；模型：${project.stepRecovery?.model ?? project.error?.model ?? "历史任务未记录具体模型"}。详细响应见右侧“流程诊断日志”。`}</p>{message && <p className="recovery-message">{message}</p>}</div><button disabled={submitting} onClick={() => void retryCurrentStep()}>{submitting ? (regeneratesStoryboard ? "正在重新生成分镜…" : "正在恢复步骤…") : (regeneratesStoryboard ? "按质检意见重新生成分镜 →" : "仅重试当前步骤 →")}</button></section>}
 
         <section className="monitor-grid wrap">
@@ -934,7 +950,7 @@ export function Studio({ view = "references", projectId }: { view?: StudioView; 
             </dl>
             <div className="status-note">
                <span className="note-mark">{isPaused ? "!" : project.status === "quality_checking" ? "↻" : "i"}</span>
-               <p>{needsCreativeRecovery ? "参考解析已安全保留。点击上方按钮后，只会重试 Great Writer 故事生成，不会重复产生视频解析费用。" : needsStepRecovery ? "当前步骤已暂停。下载诊断日志可查看阶段、模型、响应状态、字段错误和脱敏后的模型原文片段。" : isStopped ? "任务已经终止，不会继续执行后续模型步骤。请返回重新检查输入后创建新任务。" : project.status === "quality_checking" ? "正在做交付前硬质检；主题跑偏、主体漂移或命中禁项都会停止交付。" : "现在不需要操作。制作完成后会自动进入交付页。"}</p>
+               <p>{needsHighlightSelectionRecovery ? "参考视频无需重新解析。进入选择页后勾选候选高光，再确认生成新的融合创意。" : needsCreativeRecovery ? "参考解析已安全保留。点击上方按钮后，只会重试 Great Writer 故事生成，不会重复产生视频解析费用。" : needsStepRecovery ? "当前步骤已暂停。下载诊断日志可查看阶段、模型、响应状态、字段错误和脱敏后的模型原文片段。" : isStopped ? "任务已经终止，不会继续执行后续模型步骤。请返回重新检查输入后创建新任务。" : project.status === "quality_checking" ? "正在做交付前硬质检；主题跑偏、主体漂移或命中禁项都会停止交付。" : "现在不需要操作。制作完成后会自动进入交付页。"}</p>
              </div>
              <div className="live-stream" aria-live="polite">
                <div className="stream-head"><span>实时输出</span><i>{needsCreativeRecovery || needsStepRecovery ? "PAUSED" : isStopped ? "STOPPED" : "LIVE"}</i></div>
@@ -1065,7 +1081,7 @@ export function Studio({ view = "references", projectId }: { view?: StudioView; 
             <div className="section-heading"><span className="section-number">01</span><div><h2>参考内容</h2><p>添加 1～10 个视频，最多标记 3 个重点参考。</p></div><button className="example-button" onClick={loadDemoReferences}>载入示例</button></div>
             <div className={`upload-zone ${isDragging ? "dragging" : ""}`} onDragOver={(event) => { event.preventDefault(); setIsDragging(true); }} onDragLeave={() => setIsDragging(false)} onDrop={(event) => { event.preventDefault(); setIsDragging(false); addFiles(event.dataTransfer.files); }}>
               <input ref={fileInput} type="file" accept="video/mp4,video/quicktime,video/webm" multiple hidden onChange={(event) => event.target.files && addFiles(event.target.files)} />
-              <div className="upload-mark">↑</div><div><strong>拖入参考视频</strong><span>MP4 / MOV / WebM · 大文件自动分片上传</span></div><button onClick={() => fileInput.current?.click()}>选择文件</button>
+              <div className="upload-mark">↑</div><div><strong>拖入参考视频</strong><span>MP4 / MOV / WebM · 单条最多 50MB · 自动分片上传</span></div><button onClick={() => fileInput.current?.click()}>选择文件</button>
             </div>
             <div className="url-row"><span>或</span><input value={urlDraft} onChange={(event) => setUrlDraft(event.target.value)} onKeyDown={(event) => event.key === "Enter" && addUrl()} placeholder="粘贴抖音 / 小红书分享链接" aria-label="参考视频链接" /><button onClick={addUrl}>添加链接</button></div>
             {references.length > 0 && <div className="reference-list">
@@ -1129,7 +1145,7 @@ export function Studio({ view = "references", projectId }: { view?: StudioView; 
           <dl className="spec-list"><div><dt>平台</dt><dd>{platform}</dd></div><div><dt>目标</dt><dd>{goal}</dd></div><div><dt>风格</dt><dd>{style}</dd></div><div><dt>生成模型</dt><dd>{modelLabel}</dd></div><div><dt>视频规格</dt><dd>{ratio} · {resolution} · {fps} fps</dd></div><div><dt>AI 分段</dt><dd>{selectedSegmentDurations.length} 段 · 自动融合</dd></div></dl>
           <div className="cost-box"><div><span>预计平台成本</span><strong>￥{quote.totalMin.toFixed(2)}—￥{quote.totalMax.toFixed(2)}</strong></div><p>{view === "quote" ? "等待你确认；当前尚未启动 AI 视频解析。" : "进入成本确认页后，确认才会启动解析与生成。"}</p></div>
           {view === "spec" && <label className="rights-check"><input type="checkbox" checked={rightsConfirmed} onChange={(event) => setRightsConfirmed(event.target.checked)} /><span aria-hidden="true">✓</span><p>我确认有权将所提交的素材用于内部分析和视频制作。</p></label>}
-          {view === "quote" && <label className="rights-check cost-confirm"><input type="checkbox" checked={costAccepted} onChange={(event) => setCostAccepted(event.target.checked)} /><span aria-hidden="true">✓</span><p>我已了解预计平台成本区间，同意开始解析参考视频；后续仍需逐步确认 Great Writer 故事、AI 视频详细脚本与资产、分镜画布。</p></label>}
+          {view === "quote" && <label className="rights-check cost-confirm"><input type="checkbox" checked={costAccepted} onChange={(event) => setCostAccepted(event.target.checked)} /><span aria-hidden="true">✓</span><p>我已了解预计平台成本区间，同意开始解析参考视频；后续仍需逐步确认 Great Writer 故事、Visual Skills 分镜与总体提示词、资产及分镜画布。</p></label>}
           {message && <div className="form-message" role="alert">{message}</div>}
           <button className="start-button" disabled={nextDisabled || submitting || !activeProjectId} onClick={nextAction}><span>{nextLabel}</span><i>→</i></button>
           <p className="dock-footnote">当前步骤保存成功后才会进入下一页。</p>

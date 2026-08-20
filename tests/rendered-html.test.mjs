@@ -48,7 +48,7 @@ test("offers a fresh independent project after delivery", async () => {
   assert.match(studio, /本次成片与制作记录会保留/);
 });
 
-test("keeps every paid generation stage behind the four review gates", async () => {
+test("keeps every paid generation stage behind the five review gates", async () => {
   const [pipeline, projectRoute, reviewUi, referenceInspector, cost] = await Promise.all([
     readFile(new URL("../lib/pipeline.ts", import.meta.url), "utf8"),
     readFile(new URL("../app/api/projects/[id]/route.ts", import.meta.url), "utf8"),
@@ -56,6 +56,7 @@ test("keeps every paid generation stage behind the four review gates", async () 
     readFile(new URL("../app/api/references/inspect/route.ts", import.meta.url), "utf8"),
     readFile(new URL("../lib/cost.ts", import.meta.url), "utf8"),
   ]);
+  assert.match(pipeline, /awaiting_inspiration_review/);
   assert.match(pipeline, /awaiting_creative_review/);
   assert.match(pipeline, /awaiting_image_plan/);
   assert.match(pipeline, /awaiting_asset_image_review/);
@@ -66,6 +67,7 @@ test("keeps every paid generation stage behind the four review gates", async () 
   assert.match(pipeline, /23 \* 60 \* 60 \* 1000/);
   assert.match(projectRoute, /"awaiting_review"/);
   assert.match(reviewUi, /资产占位图/);
+  assert.match(reviewUi, /onClick=\{confirmInspirations\}/);
   assert.match(reviewUi, /onClick=\{confirmImagePlan\}/);
   assert.match(reviewUi, /onClick=\{confirmAssetImages\}/);
   assert.match(reviewUi, /onClick=\{confirmCanvas\}/);
@@ -102,29 +104,60 @@ test("keeps Great Writer story review separate from video-script assets", async 
   assert.match(pipeline, /overview_confirmed/);
   assert.match(pipeline, /planning_storyboard/);
   assert.match(pipeline, /STORYBOARD_PLAN_TOOL_NAME = "submit_storyboard_frames"/);
-  assert.match(pipeline, /现在才进入 AI 视频详细脚本阶段/);
+  assert.match(pipeline, /现在才进入 Visual Skills \/ video 分镜阶段/);
   assert.match(pipeline, /lockConfirmedStoryInImagePlan/);
   assert.match(pipeline, /故事锁定规则/);
   assert.match(pipeline, /imagePlan\.overview\.story/);
   assert.match(pipeline, /asset_cards 必须包含2到12项必要资产/);
-  assert.match(pipeline, /AI 视频详细脚本/);
+  assert.match(pipeline, /Visual Skills 四幕分镜与总体提示词规划/);
   assert.match(pipeline, /已确认资产卡/);
 
-  const referenceIndex = reviewUi.indexOf("原参考视频解析");
-  const storyIndex = reviewUi.indexOf("创意故事生成与修改");
+  const referenceIndex = reviewUi.indexOf("已选创意点与高光点");
+  const storyIndex = reviewUi.indexOf("全新创意故事生成与修改");
   assert.ok(referenceIndex >= 0 && referenceIndex < storyIndex);
   assert.equal(reviewUi.indexOf("创意素材资产拆分"), -1);
-  assert.match(reviewUi, /确认故事，生成 AI 视频详细脚本/);
+  assert.match(reviewUi, /确认故事，生成分镜与总体提示词/);
   assert.match(reviewUi, /已确认故事（锁定）/);
   assert.ok(reviewUi.indexOf('data-review-order="creative-overview"') > reviewUi.indexOf('className="asset-creative-card-section"'));
   assert.match(reviewUi, /确认本资产/);
-  assert.match(reviewUi, /我已检查详细视频脚本、资产关系与全局一致性/);
+  assert.match(reviewUi, /我已检查总体提示词、四幕分镜、资产关系与全局一致性/);
   assert.match(studio, /planning_images.*creative-card/);
   assert.match(studio, /planning_storyboard.*creative-card/);
   assert.match(reviewUi, /confirmed_asset_ids: imagePlan\.asset_cards\.map/);
   assert.match(reviewUi, /"failed", "cancelled", "needs_action"/);
   assert.match(approveRoute, /status: 422/);
   assert.match(creativeCardRoute, /ReviewWorkflow view="images"/);
+});
+
+test("extracts only two or three highlights per reference and waits for user selection before synthesis", async () => {
+  const [pipeline, reviewUi, approveRoute, studio] = await Promise.all([
+    readFile(new URL("../lib/pipeline.ts", import.meta.url), "utf8"),
+    readFile(new URL("../app/review-workflow.tsx", import.meta.url), "utf8"),
+    readFile(new URL("../app/api/projects/[id]/approve/route.ts", import.meta.url), "utf8"),
+    readFile(new URL("../app/studio.tsx", import.meta.url), "utf8"),
+  ]);
+  const analysisPromptStart = pipeline.indexOf("async function analyzeReference");
+  const analysisPromptEnd = pipeline.indexOf("const CREATIVE_TOOL_NAME", analysisPromptStart);
+  const analysisPrompt = pipeline.slice(analysisPromptStart, analysisPromptEnd);
+  assert.match(analysisPrompt, /creative_highlights/);
+  assert.match(analysisPrompt, /严格2到3项/);
+  assert.match(analysisPrompt, /不要逐秒复述/);
+  assert.doesNotMatch(analysisPrompt, /每2秒|每两秒|timeline_segments/);
+  assert.match(pipeline, /phase: "awaiting_inspiration_review"/);
+  const nextReferenceStart = pipeline.indexOf("function nextReferenceState");
+  const nextReferenceEnd = pipeline.indexOf("async function uploadVideoToArk", nextReferenceStart);
+  const nextReferenceFlow = pipeline.slice(nextReferenceStart, nextReferenceEnd);
+  assert.match(nextReferenceFlow, /allReferencesAnalyzed \? "awaiting_inspiration_review" : "ingesting"/);
+  assert.doesNotMatch(nextReferenceFlow, /allReferencesAnalyzed \? "synthesizing"/);
+  assert.match(pipeline, /analysesForSelectedHighlights/);
+  assert.match(pipeline, /selected_highlight_ids/);
+  assert.match(pipeline, /inspiration_recovery/);
+  assert.match(reviewUi, /勾选要采用的创意素材/);
+  assert.match(reviewUi, /未选内容不会进入融合/);
+  assert.match(reviewUi, /确认选择，生成全新创意/);
+  assert.match(approveRoute, /"inspiration"/);
+  assert.match(studio, /人工勾选创意高光/);
+  assert.match(studio, /前往勾选创意高光/);
 });
 
 test("revises one asset from user feedback and regenerates rejected storyboards", async () => {
@@ -147,7 +180,8 @@ test("revises one asset from user feedback and regenerates rejected storyboards"
   assert.match(reviewUi, /regenerate-asset-image/);
   assert.match(reviewUi, /其他资产不会重新生成/);
   assert.match(pipeline, /export async function regenerateAssetImageWithFeedback/);
-  assert.match(pipeline, /assetImages\.map\(\(image\) => image\.assetId === args\.assetId \? replacement : image\)/);
+  assert.match(pipeline, /const assetImages = draftIds\.flatMap/);
+  assert.match(pipeline, /id === args\.assetId/);
   assert.match(pipeline, /await generateAssetReferenceImage\(args\.input, imagePlan, revisedAsset/);
   assert.match(regenerateAssetImageRoute, /state\.phase !== "awaiting_asset_image_review"/);
   assert.match(regenerateAssetImageRoute, /regenerateAssetImageWithFeedback/);
@@ -255,7 +289,7 @@ test("recovers Great Writer story generation without repeating video analysis", 
   assert.match(pipeline, /strategy: "fallback"/);
   assert.match(pipeline, /CreativeStructureInvalid/);
   const validatorStart = pipeline.indexOf("function validateGeneratedCreativeCard");
-  const analysisCountDeclaration = pipeline.indexOf("const analysisCount = analyses.length", validatorStart);
+  const analysisCountDeclaration = pipeline.indexOf("const analysisBySourceIndex = new Map", validatorStart);
   const writingTraceValidation = pipeline.indexOf("const writingTrace = source.writing_trace", validatorStart);
   assert.ok(analysisCountDeclaration > validatorStart && analysisCountDeclaration < writingTraceValidation);
   assert.equal(pipeline.indexOf("const shots = source.shot_plan", validatorStart), -1);
@@ -284,6 +318,10 @@ test("persists structured-output diagnostics and supports step-only recovery", a
   assert.match(studio, /流程诊断日志/);
   assert.match(studio, /下载完整流程日志 JSON/);
   assert.match(studio, /仅重试当前步骤/);
+  assert.match(pipeline, /isTransientNetworkFailure/);
+  assert.match(pipeline, /NetworkUnavailable/);
+  assert.match(pipeline, /网络连接中断；请恢复网络后仅重试当前步骤/);
+  assert.match(studio, /"ingesting", "waiting_file"/);
 });
 
 test("auto-organizes ordinary model prose for every editable text-authoring stage", async () => {
@@ -305,13 +343,20 @@ test("auto-organizes ordinary model prose for every editable text-authoring stag
 });
 
 test("adds AI overview revision and a reusable cinematic script blueprint", async () => {
-  const [pipeline, reviewUi, overviewRoute, projectView] = await Promise.all([
+  const [pipeline, reviewUi, overviewRoute, projectView, visualPrompt] = await Promise.all([
     readFile(new URL("../lib/pipeline.ts", import.meta.url), "utf8"),
     readFile(new URL("../app/review-workflow.tsx", import.meta.url), "utf8"),
     readFile(new URL("../app/api/projects/[id]/revise-overview/route.ts", import.meta.url), "utf8"),
     readFile(new URL("../lib/project-view.ts", import.meta.url), "utf8"),
+    readFile(new URL("../lib/visual-skills-prompt.ts", import.meta.url), "utf8"),
   ]);
   assert.match(pipeline, /const CINEMATIC_SCRIPT_REFERENCE/);
+  assert.match(pipeline, /Visual Skills \/ video 分镜提示词工作流/);
+  assert.match(pipeline, /compileVisualSkillsOverallPrompt/);
+  assert.match(visualPrompt, /VISUAL_SKILLS_STORYBOARD_START/);
+  assert.match(visualPrompt, /repairFourActScript/);
+  assert.doesNotMatch(pipeline, /cinematic_script: clipText\(compiled, 12000\)/);
+  assert.doesNotMatch(pipeline, /cinematic_script\), 4800/);
   assert.match(pipeline, /世界规则 \+ 主体设定 \+ 空间关系 \+ 时间动作 \+ 摄影机 \+ 光色 \+ 物理反馈 \+ 分层声音 \+ 硬约束/);
   assert.match(pipeline, /全局视觉圣经/);
   assert.match(pipeline, /恰好4幕的完整执行脚本/);
@@ -319,11 +364,77 @@ test("adds AI overview revision and a reusable cinematic script blueprint", asyn
   assert.match(pipeline, /operation: "creative_overview_revision"/);
   assert.match(pipeline, /固定参考方法：\$\{CINEMATIC_SCRIPT_REFERENCE\}/);
   assert.match(pipeline, /脚本拆段时继续遵循：\$\{CINEMATIC_SCRIPT_REFERENCE\}/);
-  assert.match(reviewUi, /供 AI 生成视频的详细脚本/);
+  assert.match(reviewUi, /<span>总体提示词<\/span>/);
   assert.match(reviewUi, /给 AI 的总览修改意见/);
   assert.match(reviewUi, /\/revise-overview/);
   assert.match(overviewRoute, /reviseCreativeOverviewWithFeedback/);
   assert.match(projectView, /cinematic_script:/);
+  assert.match(projectView, /visibleCinematicScript/);
+  assert.match(reviewUi, /cinematicScriptComplete/);
+});
+
+function probeVisualSkillsPrompt() {
+  const moduleUrl = new URL("../lib/visual-skills-prompt.ts", import.meta.url).href;
+  const script = `
+    import { compileVisualSkillsPrompt, fourActTimeRanges, hasCompleteFourActScript } from ${JSON.stringify(moduleUrl)};
+    const frames = [1, 2, 3, 4].map((order) => ({
+      order,
+      time_range: String((order - 1) * 15) + "-" + String(order * 15) + "秒",
+      title: ["建立", "发展", "转折", "收束"][order - 1],
+      narrative_goal: "第" + order + "幕推进一个明确变化",
+      prompt: '真实空间与动作细节。完整故事：{"continuity_anchor":"不应进入分镜摘要"}',
+      motion: order < 4 ? "尾帧保持动作方向，切镜头进入下一幕" : "稳定停在最终画面，切镜头至黑场",
+    }));
+    const detail = "环境压力、身体微动作、声音锚点与物理反馈保持连续。".repeat(45);
+    const acts = [1, 2, 3, 4].map((order) => "【第" + ["一", "二", "三", "四"][order - 1] + "幕｜" + String((order - 1) * 15) + "-" + String(order * 15) + "秒】\\n" + detail + (order < 4 ? "尾帧衔接：切镜头进入下一幕。" : "最终画面：人物完成行动，切镜头至黑场。"));
+    const complete = "【全局视觉圣经】\\n" + detail + "\\n\\n" + acts.join("\\n\\n");
+    const truncated = "【全局视觉圣经】\\n" + detail + "\\n\\n" + acts.slice(0, 2).join("\\n\\n") + "\\n\\n【第三幕｜30-45秒】\\n第三幕残缺…";
+    const compile = (value) => compileVisualSkillsPrompt({
+      script: value,
+      fallbackScript: complete,
+      header: "目标模型：Seedance 2.0 Fast；总时长60秒；4:3；480p；24fps。",
+      frames,
+    });
+    const compiled = compile(complete);
+    const repaired = compile(truncated);
+    const misaligned = complete.replace("0-15秒", "0-12秒").replace("15-30秒", "12-28秒").replace("30-45秒", "28-44秒").replace("45-60秒", "44-60秒");
+    const aligned = compile(misaligned);
+    process.stdout.write(JSON.stringify({
+      sourceLength: complete.length,
+      compiledLength: compiled.length,
+      compiledComplete: hasCompleteFourActScript(compiled),
+      repairedComplete: hasCompleteFourActScript(repaired),
+      keepsFourthAct: compiled.includes("【第四幕｜45-60秒】") && compiled.includes("人物完成行动"),
+      repairedThirdAct: !repaired.includes("第三幕残缺…") && repaired.includes("【第三幕｜30-45秒】"),
+      hasFourFrameSummaries: [1, 2, 3, 4].every((order) => repaired.includes("【分镜" + order + "｜")),
+      leaksEmbeddedJson: repaired.includes("continuity_anchor"),
+      sixtySecondRanges: fourActTimeRanges(60),
+      alignsLegacyRanges: ["0-15秒", "15-30秒", "30-45秒", "45-60秒"].every((range) => aligned.includes(range)) && !aligned.includes("0-12秒"),
+    }));
+  `;
+  const result = spawnSync(process.execPath, [
+    "--no-warnings",
+    "--experimental-strip-types",
+    "--input-type=module",
+    "--eval",
+    script,
+  ], { encoding: "utf8" });
+  assert.equal(result.status, 0, result.stderr || result.stdout);
+  return JSON.parse(result.stdout);
+}
+
+test("never truncates a 60-second four-act overall prompt and repairs legacy missing acts", () => {
+  const probe = probeVisualSkillsPrompt();
+  assert.ok(probe.sourceLength > 4800);
+  assert.ok(probe.compiledLength > 4800);
+  assert.equal(probe.compiledComplete, true);
+  assert.equal(probe.repairedComplete, true);
+  assert.equal(probe.keepsFourthAct, true);
+  assert.equal(probe.repairedThirdAct, true);
+  assert.equal(probe.hasFourFrameSummaries, true);
+  assert.equal(probe.leaksEmbeddedJson, false);
+  assert.deepEqual(probe.sixtySecondRanges, ["0-15秒", "15-30秒", "30-45秒", "45-60秒"]);
+  assert.equal(probe.alignsLegacyRanges, true);
 });
 
 test("keeps every review textbox editable and persists post-generation edits", async () => {
@@ -343,6 +454,98 @@ test("keeps every review textbox editable and persists post-generation edits", a
   assert.match(pipeline, /phase: "planning_storyboard",\s*imagePlan,/);
   assert.match(reviseAssetRoute, /draftImagePlan: body\.draftImagePlan/);
   assert.match(regenerateAssetRoute, /draftImagePlan: body\.draftImagePlan/);
+});
+
+test("adds blank assets and provides a contextual AI asset chat", async () => {
+  const [reviewUi, chatRoute, pipeline, styles] = await Promise.all([
+    readFile(new URL("../app/review-workflow.tsx", import.meta.url), "utf8"),
+    readFile(new URL("../app/api/projects/[id]/asset-chat/route.ts", import.meta.url), "utf8"),
+    readFile(new URL("../lib/pipeline.ts", import.meta.url), "utf8"),
+    readFile(new URL("../app/globals.css", import.meta.url), "utf8"),
+  ]);
+  assert.match(reviewUi, /function addAsset\(\)/);
+  assert.match(reviewUi, /className="add-asset-button"/);
+  assert.match(reviewUi, />添加资产</);
+  assert.match(reviewUi, /imagePlan\.asset_cards\.length >= 12/);
+  assert.match(reviewUi, /<AssetAssistant projectId=\{project\.id\} imagePlan=\{imagePlan\}/);
+  assert.match(reviewUi, /\/asset-chat/);
+  assert.match(reviewUi, /draftImagePlan: imagePlan/);
+  assert.match(chatRoute, /answerAssetAssistant/);
+  assert.match(chatRoute, /validHistory/);
+  assert.match(pipeline, /export async function answerAssetAssistant/);
+  assert.match(pipeline, /当前资产与脚本草稿/);
+  assert.match(styles, /\.asset-review-layout/);
+  assert.match(styles, /\.asset-ai-chat/);
+});
+
+test("deletes assets from the real-asset confirmation draft without blocking approval", async () => {
+  const [reviewUi, pipeline, styles] = await Promise.all([
+    readFile(new URL("../app/review-workflow.tsx", import.meta.url), "utf8"),
+    readFile(new URL("../lib/pipeline.ts", import.meta.url), "utf8"),
+    readFile(new URL("../app/globals.css", import.meta.url), "utf8"),
+  ]);
+  assert.match(reviewUi, /function removeAsset\(index: number\)/);
+  assert.match(reviewUi, /className="asset-delete-button"/);
+  assert.match(reviewUi, /aria-label=\{`删除资产 \$\{asset\.name\}`\}/);
+  assert.match(reviewUi, /imagePlan\.asset_cards\.length <= 2/);
+  assert.match(reviewUi, /requiredAssetIds\.some\(\(id\) => !availableAssetIds\.has\(id\)\)/);
+  assert.match(pipeline, /const retainedAssetImages = state\.assetImages/);
+  assert.match(pipeline, /assetImages: retainedAssetImages/);
+  assert.doesNotMatch(pipeline, /state\.assetImages\.length !== expectedIds\.length/);
+  assert.match(styles, /\.asset-delete-button \{ position: absolute;/);
+});
+
+test("re-enables adding assets during real-asset review and generates the new image", async () => {
+  const [reviewUi, pipeline, regenerateRoute] = await Promise.all([
+    readFile(new URL("../app/review-workflow.tsx", import.meta.url), "utf8"),
+    readFile(new URL("../lib/pipeline.ts", import.meta.url), "utf8"),
+    readFile(new URL("../app/api/projects/[id]/regenerate-asset-image/route.ts", import.meta.url), "utf8"),
+  ]);
+  assert.match(reviewUi, /className="add-asset-button" disabled=\{assetTextFieldsLocked/);
+  assert.match(reviewUi, /生成新增资产图片/);
+  assert.match(reviewUi, /isNewAssetAwaitingImage \? !assetFieldsComplete/);
+  assert.match(pipeline, /const generatedNewAsset = !existingAssetImage/);
+  assert.match(pipeline, /generatedNewAsset \? "asset_image_generated"/);
+  assert.match(pipeline, /const retainedDraftIds = draftIds\.filter/);
+  assert.match(regenerateRoute, /existingAssetImage && feedback\.length < 2/);
+});
+
+test("lets the user edit every four-act anchor before video generation", async () => {
+  const [reviewUi, pipeline, projectInstructions] = await Promise.all([
+    readFile(new URL("../app/review-workflow.tsx", import.meta.url), "utf8"),
+    readFile(new URL("../lib/pipeline.ts", import.meta.url), "utf8"),
+    readFile(new URL("../AGENTS.md", import.meta.url), "utf8"),
+  ]);
+  assert.match(reviewUi, /本幕可修改内容/);
+  assert.match(reviewUi, /画面描述与生成提示词/);
+  assert.match(reviewUi, /frames: plan\.frames\.map/);
+  assert.match(reviewUi, /approve\("canvas", \{ \.\.\.canvas, image_plan: imagePlan \}\)/);
+  assert.match(pipeline, /payload\.image_plan/);
+  assert.match(pipeline, /imagePlan,/);
+  assert.match(projectInstructions, /local-only/);
+  assert.match(projectInstructions, /localhost:3001/);
+});
+
+test("analyzes every required subject and scene before showing asset cards", async () => {
+  const [reviewUi, pipeline, styles] = await Promise.all([
+    readFile(new URL("../app/review-workflow.tsx", import.meta.url), "utf8"),
+    readFile(new URL("../lib/pipeline.ts", import.meta.url), "utf8"),
+    readFile(new URL("../app/globals.css", import.meta.url), "utf8"),
+  ]);
+  assert.match(pipeline, /required: \["continuity_anchor", "asset_analysis", "asset_cards", "overview", "frames"\]/);
+  assert.match(pipeline, /required_subjects/);
+  assert.match(pipeline, /required_scenes/);
+  assert.match(pipeline, /embedded_details/);
+  assert.match(pipeline, /每一个不同的人物、动物、核心产品/);
+  assert.match(pipeline, /场景内小细节/);
+  assert.match(pipeline, /normalizeAssetAnalysis/);
+  const analysisIndex = reviewUi.indexOf("先判断需要生成什么资产");
+  const cardsIndex = reviewUi.indexOf("ASSET CREATIVE CARDS");
+  assert.ok(analysisIndex >= 0 && analysisIndex < cardsIndex);
+  assert.match(reviewUi, /需要独立生成的主体/);
+  assert.match(reviewUi, /需要整体生成的场景/);
+  assert.match(reviewUi, /并入场景，不单独生成/);
+  assert.match(styles, /\.asset-needs-analysis/);
 });
 
 function probeVideoConfig() {
@@ -446,6 +649,13 @@ test("plans, chains, quality-checks, and assembles long video segments", async (
   assert.match(requestSource, /ratio:\s*input\.ratio/);
   assert.match(requestSource, /duration:\s*segment\.duration/);
   assert.doesNotMatch(requestSource, /\b(?:fps|frame_?rate|frames_per_second)\s*:/i);
+});
+
+test("stores the assembled short-form video with one R2 put", async () => {
+  const assembly = await readFile(new URL("../lib/video-assembly.ts", import.meta.url), "utf8");
+  assert.match(assembly, /new\s+BufferTarget\s*\(\s*\)/);
+  assert.match(assembly, /await\s+storage\.put\(outputKey,\s*finalBuffer/);
+  assert.doesNotMatch(assembly, /createMultipartUpload|uploadPart|multipartWritable/);
 });
 
 test("renders five model-aware selectors and a dynamic long-form segment preview", async () => {

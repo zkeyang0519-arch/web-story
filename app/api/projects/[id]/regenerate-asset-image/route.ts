@@ -25,8 +25,8 @@ export async function POST(request: Request, context: { params: Promise<{ id: st
     const body = await request.json() as RegenerateBody;
     const assetId = body.assetId?.trim() ?? "";
     const feedback = body.feedback?.trim() ?? "";
-    if (!assetId || feedback.length < 2 || feedback.length > 1000 || !Number.isInteger(body.revision)) {
-      return Response.json({ error: "请提供资产标识、2到1000字的修改意见和有效版本号" }, { status: 422 });
+    if (!assetId || feedback.length > 1000 || !Number.isInteger(body.revision)) {
+      return Response.json({ error: "请提供资产标识、1000字以内的补充意见和有效版本号" }, { status: 422 });
     }
 
     await ensureDatabase();
@@ -41,6 +41,8 @@ export async function POST(request: Request, context: { params: Promise<{ id: st
     const state = JSON.parse(currentPipelineJson) as ArkPipelineState;
     if (state.phase !== "awaiting_asset_image_review") return Response.json({ error: "真实资产图已经锁定，不能重新生成" }, { status: 409 });
     if (state.revision !== body.revision) return Response.json({ error: "资产版本已更新，请刷新后重试" }, { status: 409 });
+    const existingAssetImage = state.assetImages?.some((image) => image.assetId === assetId);
+    if (existingAssetImage && feedback.length < 2) return Response.json({ error: "重新生成已有资产时，请填写2到1000字的修改意见" }, { status: 422 });
 
     const input = hydratePipelineInput(JSON.parse(row.inputJson), row.id, row.title);
     const snapshot = await regenerateAssetImageWithFeedback({ input, state, assetId, feedback, ownerId: owner, draftImagePlan: body.draftImagePlan });

@@ -1,5 +1,5 @@
 import {
-  AppendOnlyStreamTarget,
+  BufferTarget,
   BufferSource,
   EncodedAudioPacketSource,
   EncodedPacketSink,
@@ -9,8 +9,6 @@ import {
   Mp4OutputFormat,
   Output,
 } from "mediabunny";
-
-const MULTIPART_CHUNK_SIZE = 8 * 1024 * 1024;
 
 type AssemblyMetadata = {
   projectId: string;
@@ -33,8 +31,9 @@ export type VideoAssemblyResult = {
 /**
  * Remuxes already-compatible Seedance MP4 segments in order. It does not decode
  * or re-encode the media, so the model's native image quality and 24 fps cadence
- * are preserved. The result is streamed to R2 as fragmented MP4 to avoid holding
- * a long final video in Worker memory.
+ * are preserved. The assembled MP4 is buffered once and written to R2 with a
+ * single put, which keeps short-form delivery simple and avoids multipart
+ * completion constraints.
  */
 export async function assembleVideoSegments(
   storage: R2Bucket,
@@ -64,26 +63,12 @@ export async function assembleVideoSegments(
   const audioCodec = await firstAudio?.getCodec() ?? null;
   const audioConfig = await firstAudio?.getDecoderConfig() ?? null;
 
-  const upload = await storage.createMultipartUpload(outputKey, {
-    httpMetadata: { contentType: "video/mp4" },
-    customMetadata: {
-      projectId: metadata.projectId,
-      revision: String(metadata.revision),
-      source: "seedance-2.0-segment-assembly",
-      model: metadata.model,
-      ratio: metadata.ratio,
-      resolution: metadata.resolution,
-      fps: String(metadata.fps),
-      dimensions: `${metadata.width}x${metadata.height}`,
-      segments: String(segmentKeys.length),
-    },
-  });
-  const uploadTarget = multipartWritable(upload);
+  const outputTarget = new BufferTarget();
   const videoSource = new EncodedVideoPacketSource(videoCodec);
   const audioSource = audioCodec ? new EncodedAudioPacketSource(audioCodec) : null;
   const output = new Output({
     format: new Mp4OutputFormat({ fastStart: "fragmented", minimumFragmentDuration: 1 }),
-    target: new AppendOnlyStreamTarget(uploadTarget.writable),
+    target: outputTarget,
   });
   output.addVideoTrack(videoSource, {
     decoderConfig: videoConfig,
@@ -150,7 +135,22 @@ export async function assembleVideoSegments(
       }
     }
     await output.finalize();
-    const object = await uploadTarget.completed;
+    const finalBuffer = outputTarget.buffer;
+    if (!finalBuffer?.byteLength) throw new Error("合成视频归档校验失败");
+    const object = await storage.put(outputKey, finalBuffer, {
+      httpMetadata: { contentType: "video/mp4" },
+      customMetadata: {
+        projectId: metadata.projectId,
+        revision: String(metadata.revision),
+        source: "seedance-2.0-segment-assembly",
+        model: metadata.model,
+        ratio: metadata.ratio,
+        resolution: metadata.resolution,
+        fps: String(metadata.fps),
+        dimensions: `${metadata.width}x${metadata.height}`,
+        segments: String(segmentKeys.length),
+      },
+    });
     if (!object || object.size <= 0) throw new Error("合成视频归档校验失败");
     return {
       objectKey: outputKey,
@@ -162,7 +162,6 @@ export async function assembleVideoSegments(
     if (output.state !== "finalized" && output.state !== "canceled") {
       try { await output.cancel(); } catch { /* preserve the original error */ }
     }
-    await uploadTarget.abort();
     throw error;
   }
 }
@@ -172,68 +171,4 @@ async function readInput(storage: R2Bucket, key: string) {
   if (!object) throw new Error(`待合成片段不存在：${key}`);
   const buffer = await object.arrayBuffer();
   return { input: new Input({ formats: [MP4], source: new BufferSource(buffer) }) };
-}
-
-function multipartWritable(upload: R2MultipartUpload) {
-  const parts: R2UploadedPart[] = [];
-  let chunks: Uint8Array[] = [];
-  let buffered = 0;
-  let partNumber = 1;
-  let settled = false;
-  let resolveComplete!: (value: R2Object) => void;
-  let rejectComplete!: (reason: unknown) => void;
-  const completed = new Promise<R2Object>((resolve, reject) => {
-    resolveComplete = resolve;
-    rejectComplete = reject;
-  });
-  void completed.catch(() => undefined);
-
-  const flush = async () => {
-    if (!buffered) return;
-    const bytes = new Uint8Array(buffered);
-    let offset = 0;
-    for (const chunk of chunks) {
-      bytes.set(chunk, offset);
-      offset += chunk.byteLength;
-    }
-    chunks = [];
-    buffered = 0;
-    parts.push(await upload.uploadPart(partNumber++, bytes));
-  };
-
-  const writable = new WritableStream<Uint8Array>({
-    async write(chunk) {
-      chunks.push(chunk.slice());
-      buffered += chunk.byteLength;
-      if (buffered >= MULTIPART_CHUNK_SIZE) await flush();
-    },
-    async close() {
-      try {
-        await flush();
-        const object = await upload.complete(parts);
-        settled = true;
-        resolveComplete(object);
-      } catch (error) {
-        rejectComplete(error);
-        throw error;
-      }
-    },
-    async abort(reason) {
-      try { await upload.abort(); } finally {
-        settled = true;
-        rejectComplete(reason instanceof Error ? reason : new Error("视频合成上传已中止"));
-      }
-    },
-  });
-
-  return {
-    writable,
-    completed,
-    async abort() {
-      if (!settled) {
-        settled = true;
-        try { await upload.abort(); } finally { rejectComplete(new Error("视频合成上传已中止")); }
-      }
-    },
-  };
 }
